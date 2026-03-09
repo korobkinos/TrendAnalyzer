@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
@@ -165,3 +165,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
