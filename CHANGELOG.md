@@ -1,6 +1,23 @@
 ﻿# Changelog
 Все значимые изменения проекта фиксируются в этом файле.
 
+## [1.1.13] - 2026-03-09
+### Changed
+- Fixed `Отрисовка графика` behavior to be visualization-only:
+  - turning it off clears chart display and stops UI redraw,
+  - turning it on restores chart from archive history.
+- Archive writing remains independent from chart rendering (continues while chart rendering is off).
+- Connection overlay updates are skipped while chart rendering is off to avoid visual artifacts in archiver-only mode.
+
+## [1.1.12] - 2026-03-09
+### Changed
+- Added profile option `Отрисовка графика`:
+  - when enabled, online data is rendered as before,
+  - when disabled, rendering is skipped and app works as lightweight archiver.
+- Added per-column sorting in values table by clicking column headers (ascending/descending toggle).
+- Values table color cell rendering improved: color swatch now fills the whole cell width.
+- Added persistence of values-table header sort state in `ui_state.view`.
+
 ## [1.1.11] - 2026-03-09
 ### Changed
 - Runtime status line now shows archive mode explicitly: `архив выкл` / `архив: все точки` / `архив: изменения`.

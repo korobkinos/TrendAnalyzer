@@ -22,12 +22,14 @@ class ProfileModelTests(unittest.TestCase):
 
     def test_archive_change_only_fields_serialization(self) -> None:
         profile = ProfileConfig(
+            render_chart_enabled=False,
             archive_on_change_only=True,
             archive_deadband=0.25,
             archive_keepalive_s=90,
         )
         payload = profile.to_dict()
         restored = ProfileConfig.from_dict(payload)
+        self.assertFalse(restored.render_chart_enabled)
         self.assertTrue(restored.archive_on_change_only)
         self.assertAlmostEqual(restored.archive_deadband, 0.25, places=6)
         self.assertEqual(restored.archive_keepalive_s, 90)

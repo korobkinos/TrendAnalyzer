@@ -1,4 +1,4 @@
-# Trend Analyzer v1.1.11
+# Trend Analyzer v1.1.13
 
 Приложение для онлайн/офлайн анализа технологических сигналов с Modbus TCP, архивом и печатью графиков.
 
@@ -57,4 +57,3 @@ powershell -ExecutionPolicy Bypass -File .\build_portable.ps1
 
 - см. `CHANGELOG.md`
 - см. `SESSION_HANDOFF_RU.md`
-

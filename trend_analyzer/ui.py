@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QSplitter,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTabBar,
@@ -125,6 +126,8 @@ class MainWindow(QMainWindow):
         self._scales_table_last_rowcount = -1
         self._stats_table_fitted_once = False
         self._values_sort_mode = "name_asc"
+        self._values_header_sort_column: int | None = None
+        self._values_header_sort_desc: bool = False
         self._last_values_rows: list[dict] = []
         self._force_close = False
         self._tray_icon: QSystemTrayIcon | None = None
@@ -285,6 +288,8 @@ class MainWindow(QMainWindow):
         header.setStretchLastSection(False)
         for col in range(self.values_table.columnCount()):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self._on_values_header_clicked)
         header.sectionResized.connect(lambda *_args: self._on_table_column_resized("values_table"))
         self.values_table.verticalHeader().setVisible(False)
         self.values_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -519,6 +524,9 @@ class MainWindow(QMainWindow):
         self.render_interval_spin.setSingleStep(50)
         self.render_interval_spin.setSuffix(" ms")
         self.render_interval_spin.valueChanged.connect(self._on_render_interval_changed)
+        self.render_chart_checkbox = QCheckBox("Включена")
+        self.render_chart_checkbox.setChecked(True)
+        self.render_chart_checkbox.toggled.connect(self._on_render_chart_toggled)
         self.archive_interval_spin = QSpinBox()
         self.archive_interval_spin.setRange(50, 600000)
         self.archive_interval_spin.setSuffix(" ms")
@@ -553,6 +561,7 @@ class MainWindow(QMainWindow):
         form.addRow("ID устройства (Unit ID)", self.unit_id_spin)
         form.addRow("Частота опроса", self.poll_interval_spin)
         form.addRow("Интервал отрисовки", self.render_interval_spin)
+        form.addRow("Отрисовка графика", self.render_chart_checkbox)
         form.addRow("Частота архивации", self.archive_interval_spin)
         form.addRow("Архив: только изменения", self.archive_on_change_checkbox)
         form.addRow("Архив: deadband", self.archive_deadband_spin)
@@ -2081,6 +2090,12 @@ class MainWindow(QMainWindow):
             "auto_x": bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True,
             "cursor_enabled": bool(self.action_cursor.isChecked()) if hasattr(self, "action_cursor") else False,
             "values_sort_mode": str(self.values_sort_combo.currentData() or self._values_sort_mode),
+            "values_sort_column": (
+                int(self._values_header_sort_column)
+                if self._values_header_sort_column is not None
+                else None
+            ),
+            "values_sort_desc": bool(self._values_header_sort_desc),
             "values_panel_collapsed": bool(self._values_collapsed),
             "values_panel_closed": bool(self._values_closed),
             "x_range": [float(x_min), float(x_max)],
@@ -2167,6 +2182,23 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.values_sort_combo.setCurrentIndex(idx)
                 self._values_sort_mode = sort_mode
+        raw_sort_column = view.get("values_sort_column")
+        try:
+            self._values_header_sort_column = None if raw_sort_column is None else int(raw_sort_column)
+        except (TypeError, ValueError):
+            self._values_header_sort_column = None
+        self._values_header_sort_desc = bool(view.get("values_sort_desc", False))
+        header = self.values_table.horizontalHeader()
+        if self._values_header_sort_column is None:
+            try:
+                header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+            except Exception:
+                pass
+        else:
+            header.setSortIndicator(
+                int(self._values_header_sort_column),
+                Qt.SortOrder.DescendingOrder if self._values_header_sort_desc else Qt.SortOrder.AscendingOrder,
+            )
 
         values_closed = bool(view.get("values_panel_closed", False))
         values_collapsed = bool(view.get("values_panel_collapsed", False))
@@ -2256,6 +2288,9 @@ class MainWindow(QMainWindow):
         self.unit_id_spin.setValue(profile.unit_id)
         self.poll_interval_spin.setValue(profile.poll_interval_ms)
         self.render_interval_spin.setValue(max(50, int(profile.render_interval_ms)))
+        self.render_chart_checkbox.blockSignals(True)
+        self.render_chart_checkbox.setChecked(bool(profile.render_chart_enabled))
+        self.render_chart_checkbox.blockSignals(False)
         self.archive_interval_spin.setValue(profile.archive_interval_ms)
         self.archive_on_change_checkbox.setChecked(bool(profile.archive_on_change_only))
         self.archive_deadband_spin.setValue(max(0.0, float(profile.archive_deadband)))
@@ -2284,10 +2319,15 @@ class MainWindow(QMainWindow):
             grid_y=profile.plot_grid_y,
         )
         self._apply_runtime_view_state(profile)
+        self._on_render_chart_toggled(self.render_chart_checkbox.isChecked())
         self._schedule_apply_saved_widths_all_tables(profile.id)
         self._apply_work_mode_ui(profile.work_mode)
         self._sync_mode_actions()
-        if str(profile.work_mode or "online") == "online" and (self._worker is None or not self._worker.isRunning()):
+        if (
+            str(profile.work_mode or "online") == "online"
+            and bool(profile.render_chart_enabled)
+            and (self._worker is None or not self._worker.isRunning())
+        ):
             auto_x_enabled = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True
             self._load_recent_online_history_from_db(adjust_x_range=auto_x_enabled, silent=True)
 
@@ -2364,7 +2404,9 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _apply_color_swatch_style(button: QPushButton, color: str) -> None:
         button.setText("")
-        button.setFixedWidth(28)
+        button.setMinimumWidth(1)
+        button.setMaximumWidth(16777215)
+        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         button.setStyleSheet(
             "QPushButton {"
             f"background-color: {color};"
@@ -2383,11 +2425,54 @@ class MainWindow(QMainWindow):
 
     def _on_values_sort_changed(self, _index: int) -> None:
         self._values_sort_mode = str(self.values_sort_combo.currentData() or "name_asc")
+        self._values_header_sort_column = None
+        self._values_header_sort_desc = False
+        header = self.values_table.horizontalHeader()
+        try:
+            header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        except Exception:
+            pass
         if self._last_values_rows:
             self._update_values_table(self._last_values_rows, False)
         self._mark_config_dirty()
 
+    def _on_values_header_clicked(self, column: int) -> None:
+        if self._values_header_sort_column == int(column):
+            self._values_header_sort_desc = not self._values_header_sort_desc
+        else:
+            self._values_header_sort_column = int(column)
+            self._values_header_sort_desc = False
+        order = Qt.SortOrder.DescendingOrder if self._values_header_sort_desc else Qt.SortOrder.AscendingOrder
+        self.values_table.horizontalHeader().setSortIndicator(int(column), order)
+        if self._last_values_rows:
+            self._update_values_table(self._last_values_rows, False)
+        self._mark_config_dirty()
+
+    @staticmethod
+    def _values_header_sort_key(row: dict, column: int):
+        if column == 0:
+            return int(bool(row.get("enabled", True)))
+        if column == 1:
+            return str(row.get("name", "")).lower()
+        if column == 2:
+            return int(row.get("axis_index", 1))
+        if column == 3:
+            value = row.get("value")
+            return float("-inf") if value is None else float(value)
+        if column == 4:
+            ts = row.get("ts")
+            return float("-inf") if ts is None else float(ts)
+        if column == 5:
+            return str(row.get("mode", "")).lower()
+        if column == 6:
+            return str(row.get("color", "")).lower()
+        return str(row.get("name", "")).lower()
+
     def _sorted_values_rows(self, rows: list[dict]) -> list[dict]:
+        if self._values_header_sort_column is not None:
+            col = int(self._values_header_sort_column)
+            reverse = bool(self._values_header_sort_desc)
+            return sorted(rows, key=lambda row: self._values_header_sort_key(row, col), reverse=reverse)
         mode = str(self._values_sort_mode or "name_asc")
         if mode == "name_desc":
             return sorted(rows, key=lambda row: str(row.get("name", "")).lower(), reverse=True)
@@ -2446,6 +2531,7 @@ class MainWindow(QMainWindow):
         profile.unit_id = self.unit_id_spin.value()
         profile.poll_interval_ms = self.poll_interval_spin.value()
         profile.render_interval_ms = self.render_interval_spin.value()
+        profile.render_chart_enabled = bool(self.render_chart_checkbox.isChecked())
         profile.archive_interval_ms = self.archive_interval_spin.value()
         profile.archive_on_change_only = bool(self.archive_on_change_checkbox.isChecked())
         profile.archive_deadband = max(0.0, float(self.archive_deadband_spin.value()))
@@ -2483,6 +2569,7 @@ class MainWindow(QMainWindow):
             "unit_id": int(profile.unit_id),
             "poll_interval_ms": int(profile.poll_interval_ms),
             "render_interval_ms": int(profile.render_interval_ms),
+            "render_chart_enabled": bool(profile.render_chart_enabled),
             "archive_interval_ms": int(profile.archive_interval_ms),
             "archive_on_change_only": bool(profile.archive_on_change_only),
             "archive_deadband": float(profile.archive_deadband),
@@ -2533,6 +2620,7 @@ class MainWindow(QMainWindow):
             minimum=50,
             maximum=5000,
         )
+        profile.render_chart_enabled = bool(payload.get("render_chart_enabled", profile.render_chart_enabled))
         profile.archive_interval_ms = int_or(
             profile.archive_interval_ms,
             "archive_interval_ms",
@@ -2566,6 +2654,9 @@ class MainWindow(QMainWindow):
         self.unit_id_spin.setValue(profile.unit_id)
         self.poll_interval_spin.setValue(profile.poll_interval_ms)
         self.render_interval_spin.setValue(max(50, int(profile.render_interval_ms)))
+        self.render_chart_checkbox.blockSignals(True)
+        self.render_chart_checkbox.setChecked(bool(profile.render_chart_enabled))
+        self.render_chart_checkbox.blockSignals(False)
         self.archive_interval_spin.setValue(profile.archive_interval_ms)
         self.archive_on_change_checkbox.setChecked(bool(profile.archive_on_change_only))
         self.archive_deadband_spin.setValue(max(0.0, float(profile.archive_deadband)))
@@ -3907,6 +3998,27 @@ class MainWindow(QMainWindow):
         if not self._updating_ui:
             self._mark_config_dirty()
 
+    def _on_render_chart_toggled(self, checked: bool) -> None:
+        enabled = bool(checked)
+        self.current_profile.render_chart_enabled = enabled
+        if enabled:
+            mode = str(self.mode_combo.currentData() or "online")
+            if mode == "online":
+                auto_x_enabled = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True
+                self._load_recent_online_history_from_db(adjust_x_range=auto_x_enabled, silent=True)
+            if self._worker is not None and self._worker.isRunning():
+                if not self._render_timer.isActive():
+                    self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
+                    self._render_timer.start()
+        else:
+            self._pending_render_samples = []
+            if self._render_timer.isActive():
+                self._render_timer.stop()
+            self.chart.set_connection_events([])
+            self.chart.clear_data()
+        if not self._updating_ui:
+            self._mark_config_dirty()
+
     def _apply_render_interval_runtime(self, interval_ms: int | None = None) -> None:
         if interval_ms is None:
             interval_ms = int(getattr(self.current_profile, "render_interval_ms", 200) or 200)
@@ -4927,7 +5039,9 @@ class MainWindow(QMainWindow):
                     continue
                 samples_map.setdefault(sid, []).append([ts_f, value_f])
 
-            connection_events = self._query_connection_events(conn, float(start_ts), float(last_ts))
+            now_ts = datetime.now().timestamp()
+            event_end_ts = max(float(last_ts), float(now_ts))
+            connection_events = self._query_connection_events(conn, float(start_ts), float(event_end_ts))
         except Exception:
             return False
         finally:
@@ -4936,9 +5050,11 @@ class MainWindow(QMainWindow):
         if not samples_map:
             return False
 
-        now_ts = datetime.now().timestamp()
         gap_threshold = max(2.0, float(self.current_profile.poll_interval_ms) / 1000.0 * 2.5)
-        if now_ts - float(last_ts) > gap_threshold:
+        worker_running = self._worker is not None and self._worker.isRunning()
+        runtime_connected = bool(self._runtime_connected)
+        can_infer_gap_disconnect = not (worker_running and runtime_connected)
+        if can_infer_gap_disconnect and (now_ts - float(last_ts) > gap_threshold):
             if not connection_events or int(connection_events[-1][1]) != 0:
                 connection_events.append([float(last_ts), 0.0])
                 connection_events = self._normalize_connection_events(connection_events)
@@ -5010,11 +5126,15 @@ class MainWindow(QMainWindow):
         self._signal_types_by_id = {
             str(signal.id): str(signal.data_type or "int16") for signal in self.current_profile.signals if str(signal.id)
         }
-        restored = self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
+        restored = False
+        if bool(self.current_profile.render_chart_enabled):
+            restored = self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
         if not restored:
             self._connection_events = []
             self._last_connection_state = None
             self.chart.set_connection_events([])
+        if not bool(self.current_profile.render_chart_enabled):
+            self.chart.clear_data()
         self._pending_render_samples = []
 
         self._worker = ModbusWorker(copy.deepcopy(self.current_profile))
@@ -5023,7 +5143,7 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._on_worker_error)
         self._worker.start()
         self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
-        if not self._render_timer.isActive():
+        if bool(self.current_profile.render_chart_enabled) and not self._render_timer.isActive():
             self._render_timer.start()
 
         self.action_start.setEnabled(False)
@@ -5064,7 +5184,8 @@ class MainWindow(QMainWindow):
             is_stop_disconnect = self._stopping_worker and not state
             if not is_stop_disconnect:
                 self._connection_events.append(event)
-                self.chart.add_connection_event(ts, state)
+                if bool(self.current_profile.render_chart_enabled):
+                    self.chart.add_connection_event(ts, state)
                 if self._archive_store is not None:
                     try:
                         self._archive_store.insert_connection_event(self.current_profile.id, ts, state)
@@ -5344,14 +5465,19 @@ class MainWindow(QMainWindow):
         return rows
 
     def _on_samples_ready(self, ts: float, samples: dict[str, tuple[str, float]]) -> None:
-        self._pending_render_samples.append((float(ts), samples))
-        if len(self._pending_render_samples) > self._max_pending_render_batches:
-            # Keep the most recent section of stream to avoid unbounded growth
-            # if UI thread is temporarily slower than poll thread.
-            self._pending_render_samples = self._pending_render_samples[-self._max_pending_render_batches :]
-        if not self._render_timer.isActive():
-            self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
-            self._render_timer.start()
+        if bool(self.current_profile.render_chart_enabled):
+            self._pending_render_samples.append((float(ts), samples))
+            if len(self._pending_render_samples) > self._max_pending_render_batches:
+                # Keep the most recent section of stream to avoid unbounded growth
+                # if UI thread is temporarily slower than poll thread.
+                self._pending_render_samples = self._pending_render_samples[-self._max_pending_render_batches :]
+            if not self._render_timer.isActive():
+                self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
+                self._render_timer.start()
+        else:
+            self._pending_render_samples = []
+            if self._render_timer.isActive():
+                self._render_timer.stop()
 
         archive_interval_s = max(0.05, self.current_profile.archive_interval_ms / 1000.0)
         if ts - self._last_archive_ts < archive_interval_s:

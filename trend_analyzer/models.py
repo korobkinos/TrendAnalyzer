@@ -130,6 +130,7 @@ class ProfileConfig:
     unit_id: int = 1
     poll_interval_ms: int = 500
     render_interval_ms: int = 200
+    render_chart_enabled: bool = True
     archive_interval_ms: int = 1000
     archive_on_change_only: bool = False
     archive_deadband: float = 0.0
@@ -167,6 +168,7 @@ class ProfileConfig:
             "unit_id": self.unit_id,
             "poll_interval_ms": self.poll_interval_ms,
             "render_interval_ms": self.render_interval_ms,
+            "render_chart_enabled": self.render_chart_enabled,
             "archive_interval_ms": self.archive_interval_ms,
             "archive_on_change_only": self.archive_on_change_only,
             "archive_deadband": self.archive_deadband,
@@ -223,6 +225,7 @@ class ProfileConfig:
             unit_id=int(payload.get("unit_id") or 1),
             poll_interval_ms=max(50, int(payload.get("poll_interval_ms") or 500)),
             render_interval_ms=max(50, int(payload.get("render_interval_ms") or 200)),
+            render_chart_enabled=bool(payload.get("render_chart_enabled", True)),
             archive_interval_ms=max(50, int(payload.get("archive_interval_ms") or 1000)),
             archive_on_change_only=bool(payload.get("archive_on_change_only", False)),
             archive_deadband=max(0.0, float(payload.get("archive_deadband", 0.0))),
