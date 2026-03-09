@@ -131,6 +131,9 @@ class ProfileConfig:
     poll_interval_ms: int = 500
     render_interval_ms: int = 200
     archive_interval_ms: int = 1000
+    archive_on_change_only: bool = False
+    archive_deadband: float = 0.0
+    archive_keepalive_s: int = 60
     archive_retention_days: int = 7  # 0 = unlimited
     archive_to_db: bool = True
     work_mode: str = "online"  # online | offline
@@ -165,6 +168,9 @@ class ProfileConfig:
             "poll_interval_ms": self.poll_interval_ms,
             "render_interval_ms": self.render_interval_ms,
             "archive_interval_ms": self.archive_interval_ms,
+            "archive_on_change_only": self.archive_on_change_only,
+            "archive_deadband": self.archive_deadband,
+            "archive_keepalive_s": self.archive_keepalive_s,
             "archive_retention_days": self.archive_retention_days,
             "archive_to_db": self.archive_to_db,
             "work_mode": self.work_mode,
@@ -218,6 +224,9 @@ class ProfileConfig:
             poll_interval_ms=max(50, int(payload.get("poll_interval_ms") or 500)),
             render_interval_ms=max(50, int(payload.get("render_interval_ms") or 200)),
             archive_interval_ms=max(50, int(payload.get("archive_interval_ms") or 1000)),
+            archive_on_change_only=bool(payload.get("archive_on_change_only", False)),
+            archive_deadband=max(0.0, float(payload.get("archive_deadband", 0.0))),
+            archive_keepalive_s=max(0, int(payload.get("archive_keepalive_s", 60))),
             archive_retention_days=max(0, int(payload.get("archive_retention_days", 7))),
             archive_to_db=bool(payload.get("archive_to_db", True)),
             work_mode=work_mode,

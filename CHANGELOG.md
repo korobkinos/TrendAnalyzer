@@ -1,6 +1,24 @@
 ﻿# Changelog
 Все значимые изменения проекта фиксируются в этом файле.
 
+## [1.1.11] - 2026-03-09
+### Changed
+- Runtime status line now shows archive mode explicitly: `архив выкл` / `архив: все точки` / `архив: изменения`.
+- Added immediate runtime-status refresh when archive filter and mode/write options are changed.
+- Memory safety improvements:
+  - reduced max pending UI render queue batches (backpressure) to lower RAM spikes under heavy load,
+  - added pruning of in-memory connection event history to active chart data window.
+
+## [1.1.10] - 2026-03-09
+### Changed
+- Added archive optimization mode: write samples only when values change (`archive_on_change_only`).
+- Added configurable archive filters:
+  - `archive_deadband` (minimum delta for write),
+  - `archive_keepalive_s` (forced periodic write even without change, `0` = disabled).
+- Added UI controls in connection settings for the new archive filters.
+- Added save/load of these options in profile config and connection config export/import.
+- Runtime archive writer now applies per-signal filtering before DB insert, reducing long-term archive growth.
+
 ## [1.1.9] - 2026-03-09
 ### Changed
 - Removed legacy archive compatibility paths; app now works only with the new compact DB schema.

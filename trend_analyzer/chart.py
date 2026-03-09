@@ -297,6 +297,39 @@ class MultiAxisChart(QWidget):
         self._connection_events.append((ts_f, state))
         self._render_connection_overlay()
 
+    def _data_ts_bounds(self) -> tuple[float | None, float | None]:
+        min_ts: float | None = None
+        max_ts: float | None = None
+        for xs, _ys in self._buffers.values():
+            if not xs:
+                continue
+            left = float(xs[0])
+            right = float(xs[-1])
+            if min_ts is None or left < min_ts:
+                min_ts = left
+            if max_ts is None or right > max_ts:
+                max_ts = right
+        return min_ts, max_ts
+
+    def _prune_connection_events_to_data_window(self) -> None:
+        if not self._connection_events:
+            return
+        min_ts, _max_ts = self._data_ts_bounds()
+        if min_ts is None:
+            return
+        cutoff = float(min_ts) - 5.0
+        first_idx: int | None = None
+        for idx, (ts, _state) in enumerate(self._connection_events):
+            if float(ts) >= cutoff:
+                first_idx = idx
+                break
+        if first_idx is None:
+            keep_from = max(0, len(self._connection_events) - 1)
+        else:
+            keep_from = max(0, first_idx - 1)
+        if keep_from > 0:
+            self._connection_events = self._connection_events[keep_from:]
+
     def _axis_y_range(self, axis_index: int) -> tuple[float, float]:
         view = self._view_for_axis(axis_index)
         if view is None:
@@ -463,6 +496,7 @@ class MultiAxisChart(QWidget):
 
         if last_ts is not None:
             self._last_sample_ts = last_ts
+        self._prune_connection_events_to_data_window()
         self._redraw_all()
         if self._connection_events and not self._connection_events[-1][1]:
             self._render_connection_overlay()
@@ -509,6 +543,7 @@ class MultiAxisChart(QWidget):
                     last_ts = candidate
 
         self._last_sample_ts = last_ts
+        self._prune_connection_events_to_data_window()
         self._redraw_all()
         self._apply_auto_range()
         self._render_connection_overlay()

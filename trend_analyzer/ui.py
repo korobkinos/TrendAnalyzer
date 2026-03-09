@@ -132,6 +132,9 @@ class MainWindow(QMainWindow):
         self._archive_store: ArchiveStore | None = None
         self._last_archive_ts = 0.0
         self._last_retention_cleanup_ts = 0.0
+        self._archive_last_values: dict[str, float] = {}
+        self._archive_last_written_ts: dict[str, float] = {}
+        self._signal_types_by_id: dict[str, str] = {}
         self._connection_events: list[list[float]] = []
         self._last_connection_state: bool | None = None
         self._stopping_worker = False
@@ -150,7 +153,9 @@ class MainWindow(QMainWindow):
         self._render_timer.setSingleShot(False)
         self._render_timer.timeout.connect(self._flush_pending_render_samples)
         self._pending_render_samples: list[tuple[float, dict[str, tuple[str, float]]]] = []
-        self._max_pending_render_batches = 5000
+        # Backpressure cap for UI queue to avoid high RAM usage when UI redraw
+        # cannot keep up with very fast polling / many signals.
+        self._max_pending_render_batches = 1200
         self._runtime_connected = False
         self._cpu_count = max(1, int(os.cpu_count() or 1))
         self._last_proc_cpu_time = time.process_time()
@@ -332,7 +337,7 @@ class MainWindow(QMainWindow):
         self.runtime_status_label.setStyleSheet("font-size: 11px; color: #9aa0a6;")
         self.runtime_status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.runtime_status_label.setContentsMargins(0, 0, 0, 0)
-        self.runtime_status_label.setMinimumWidth(260)
+        self.runtime_status_label.setMinimumWidth(420)
         status_bar.addPermanentWidget(self.runtime_status_label, 0)
         self._status_right_spacer = QLabel("")
         self._status_right_spacer.setFixedWidth(10)
@@ -434,17 +439,34 @@ class MainWindow(QMainWindow):
             archive_bytes = self._archive_file_size_bytes()
             mem_text = self._format_bytes_human(mem_bytes) if mem_bytes is not None else "-"
             archive_text = self._format_bytes_human(archive_bytes)
+            mode = str(getattr(self.current_profile, "work_mode", "online") or "online")
+            write_enabled = bool(getattr(self.current_profile, "archive_to_db", False)) and mode == "online"
+            if not write_enabled:
+                archive_mode_text = "архив выкл"
+            elif bool(getattr(self.current_profile, "archive_on_change_only", False)):
+                archive_mode_text = "архив: изменения"
+            else:
+                archive_mode_text = "архив: все точки"
             if hasattr(self, "runtime_indicator_label"):
                 self.runtime_indicator_label.setStyleSheet(f"font-size: 12px; color: {indicator_color};")
             if hasattr(self, "runtime_status_label"):
                 self.runtime_status_label.setText(
-                    f"{indicator_text}, CPU {cpu_percent:.1f}%, RAM {mem_text}, Архив {archive_text}"
+                    f"{indicator_text}, CPU {cpu_percent:.1f}%, RAM {mem_text}, Архив {archive_text}, {archive_mode_text}"
                 )
         except Exception:
             if hasattr(self, "runtime_indicator_label"):
                 self.runtime_indicator_label.setStyleSheet("font-size: 12px; color: #ef5350;")
             if hasattr(self, "runtime_status_label"):
                 self.runtime_status_label.setText("не подключено, CPU -, RAM -, Архив -")
+
+    def _on_archive_filter_settings_changed(self, *_args) -> None:
+        if self._updating_ui:
+            return
+        self.current_profile.archive_on_change_only = bool(self.archive_on_change_checkbox.isChecked())
+        self.current_profile.archive_deadband = max(0.0, float(self.archive_deadband_spin.value()))
+        self.current_profile.archive_keepalive_s = max(0, int(self.archive_keepalive_spin.value()))
+        self._update_runtime_status_panel()
+        self._mark_config_dirty()
 
     def _build_connection_window(self) -> None:
         flags = (
@@ -500,6 +522,18 @@ class MainWindow(QMainWindow):
         self.archive_interval_spin = QSpinBox()
         self.archive_interval_spin.setRange(50, 600000)
         self.archive_interval_spin.setSuffix(" ms")
+        self.archive_on_change_checkbox = QCheckBox("Только при изменении")
+        self.archive_on_change_checkbox.toggled.connect(self._on_archive_filter_settings_changed)
+        self.archive_deadband_spin = QDoubleSpinBox()
+        self.archive_deadband_spin.setRange(0.0, 1_000_000_000.0)
+        self.archive_deadband_spin.setDecimals(6)
+        self.archive_deadband_spin.setSingleStep(0.001)
+        self.archive_deadband_spin.valueChanged.connect(self._on_archive_filter_settings_changed)
+        self.archive_keepalive_spin = QSpinBox()
+        self.archive_keepalive_spin.setRange(0, 86400)
+        self.archive_keepalive_spin.setSuffix(" c")
+        self.archive_keepalive_spin.setSpecialValueText("Отключен")
+        self.archive_keepalive_spin.valueChanged.connect(self._on_archive_filter_settings_changed)
         self.archive_retention_days_spin = QSpinBox()
         self.archive_retention_days_spin.setRange(0, 3650)
         self.archive_retention_days_spin.setSuffix(" дн")
@@ -520,6 +554,9 @@ class MainWindow(QMainWindow):
         form.addRow("Частота опроса", self.poll_interval_spin)
         form.addRow("Интервал отрисовки", self.render_interval_spin)
         form.addRow("Частота архивации", self.archive_interval_spin)
+        form.addRow("Архив: только изменения", self.archive_on_change_checkbox)
+        form.addRow("Архив: deadband", self.archive_deadband_spin)
+        form.addRow("Архив: keepalive", self.archive_keepalive_spin)
         form.addRow("Глубина архива", self.archive_retention_days_spin)
         form.addRow("Таймаут", self.timeout_spin)
         form.addRow("Повторы", self.retries_spin)
@@ -1832,6 +1869,7 @@ class MainWindow(QMainWindow):
     def _on_archive_write_db_toggled(self, checked: bool) -> None:
         self.archive_to_db_checkbox.setChecked(bool(checked))
         self.current_profile.archive_to_db = bool(checked)
+        self._update_runtime_status_panel()
         self._mark_config_dirty()
 
     def _set_close_behavior(self, behavior: str, checked: bool) -> None:
@@ -2219,6 +2257,9 @@ class MainWindow(QMainWindow):
         self.poll_interval_spin.setValue(profile.poll_interval_ms)
         self.render_interval_spin.setValue(max(50, int(profile.render_interval_ms)))
         self.archive_interval_spin.setValue(profile.archive_interval_ms)
+        self.archive_on_change_checkbox.setChecked(bool(profile.archive_on_change_only))
+        self.archive_deadband_spin.setValue(max(0.0, float(profile.archive_deadband)))
+        self.archive_keepalive_spin.setValue(max(0, int(profile.archive_keepalive_s)))
         self.archive_retention_days_spin.setValue(max(0, int(profile.archive_retention_days)))
         self.timeout_spin.setValue(profile.timeout_s)
         self.retries_spin.setValue(profile.retries)
@@ -2406,6 +2447,9 @@ class MainWindow(QMainWindow):
         profile.poll_interval_ms = self.poll_interval_spin.value()
         profile.render_interval_ms = self.render_interval_spin.value()
         profile.archive_interval_ms = self.archive_interval_spin.value()
+        profile.archive_on_change_only = bool(self.archive_on_change_checkbox.isChecked())
+        profile.archive_deadband = max(0.0, float(self.archive_deadband_spin.value()))
+        profile.archive_keepalive_s = max(0, int(self.archive_keepalive_spin.value()))
         profile.archive_retention_days = self.archive_retention_days_spin.value()
         profile.archive_to_db = bool(self.archive_to_db_checkbox.isChecked())
         profile.work_mode = str(self.mode_combo.currentData() or "online")
@@ -2440,6 +2484,9 @@ class MainWindow(QMainWindow):
             "poll_interval_ms": int(profile.poll_interval_ms),
             "render_interval_ms": int(profile.render_interval_ms),
             "archive_interval_ms": int(profile.archive_interval_ms),
+            "archive_on_change_only": bool(profile.archive_on_change_only),
+            "archive_deadband": float(profile.archive_deadband),
+            "archive_keepalive_s": int(profile.archive_keepalive_s),
             "archive_retention_days": int(profile.archive_retention_days),
             "timeout_s": float(profile.timeout_s),
             "retries": int(profile.retries),
@@ -2492,6 +2539,14 @@ class MainWindow(QMainWindow):
             minimum=50,
             maximum=600000,
         )
+        profile.archive_on_change_only = bool(payload.get("archive_on_change_only", profile.archive_on_change_only))
+        profile.archive_deadband = float_or(profile.archive_deadband, "archive_deadband", minimum=0.0, maximum=1.0e9)
+        profile.archive_keepalive_s = int_or(
+            profile.archive_keepalive_s,
+            "archive_keepalive_s",
+            minimum=0,
+            maximum=86400,
+        )
         profile.archive_retention_days = int_or(
             profile.archive_retention_days,
             "archive_retention_days",
@@ -2512,6 +2567,9 @@ class MainWindow(QMainWindow):
         self.poll_interval_spin.setValue(profile.poll_interval_ms)
         self.render_interval_spin.setValue(max(50, int(profile.render_interval_ms)))
         self.archive_interval_spin.setValue(profile.archive_interval_ms)
+        self.archive_on_change_checkbox.setChecked(bool(profile.archive_on_change_only))
+        self.archive_deadband_spin.setValue(max(0.0, float(profile.archive_deadband)))
+        self.archive_keepalive_spin.setValue(max(0, int(profile.archive_keepalive_s)))
         self.archive_retention_days_spin.setValue(max(0, int(profile.archive_retention_days)))
         self.timeout_spin.setValue(profile.timeout_s)
         self.retries_spin.setValue(profile.retries)
@@ -2634,6 +2692,8 @@ class MainWindow(QMainWindow):
         self._last_connection_state = None
         self._last_archive_ts = 0.0
         self._last_retention_cleanup_ts = 0.0
+        self._archive_last_values = {}
+        self._archive_last_written_ts = {}
         self.chart.set_connection_events([])
         self.chart.clear_data()
         self._update_runtime_status_panel()
@@ -3836,6 +3896,7 @@ class MainWindow(QMainWindow):
         mode = str(self.mode_combo.currentData() or "online")
         self.current_profile.work_mode = mode
         self._apply_work_mode_ui(mode)
+        self._update_runtime_status_panel()
         self._sync_mode_actions()
 
     def _on_render_interval_changed(self, value: int) -> None:
@@ -3879,6 +3940,7 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Статус: онлайн режим, опрос запущен")
         else:
             self.status_label.setText("Статус: офлайн режим (архив)")
+        self._update_runtime_status_panel()
 
     @staticmethod
     def _archive_safe_ts(ts: float | None) -> str:
@@ -4933,6 +4995,9 @@ class MainWindow(QMainWindow):
         if self._archive_store is not None:
             self._archive_store.close()
             self._archive_store = None
+        self._archive_last_values = {}
+        self._archive_last_written_ts = {}
+        self._signal_types_by_id = {}
 
         if self.archive_to_db_checkbox.isChecked():
             self._archive_store = ArchiveStore(self.current_profile.db_path or str(DEFAULT_DB_PATH))
@@ -4940,6 +5005,11 @@ class MainWindow(QMainWindow):
             self._archive_store = None
         self._last_archive_ts = 0.0
         self._last_retention_cleanup_ts = 0.0
+        self._archive_last_values = {}
+        self._archive_last_written_ts = {}
+        self._signal_types_by_id = {
+            str(signal.id): str(signal.data_type or "int16") for signal in self.current_profile.signals if str(signal.id)
+        }
         restored = self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
         if not restored:
             self._connection_events = []
@@ -5239,6 +5309,40 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.status_label.setText(f"Ошибка очистки архива: {exc}")
 
+    def _should_archive_signal_sample(self, signal_id: str, ts: float, value: float) -> bool:
+        last_value = self._archive_last_values.get(signal_id)
+        last_ts = self._archive_last_written_ts.get(signal_id)
+        if last_value is None or last_ts is None:
+            return True
+
+        keepalive_s = max(0.0, float(self.current_profile.archive_keepalive_s))
+        if keepalive_s > 0.0 and (float(ts) - float(last_ts)) >= keepalive_s:
+            return True
+
+        signal_type = str(self._signal_types_by_id.get(signal_id, "int16")).lower()
+        if signal_type == "bool":
+            # BOOL should be stored on edge changes only.
+            return int(round(float(value))) != int(round(float(last_value)))
+
+        deadband = max(0.0, float(self.current_profile.archive_deadband))
+        delta = abs(float(value) - float(last_value))
+        if math.isnan(delta):
+            return True
+        return delta > deadband
+
+    def _filter_archive_rows(self, ts: float, samples: dict[str, tuple[str, float]]) -> list[tuple[str, str, float]]:
+        rows: list[tuple[str, str, float]] = []
+        only_changes = bool(self.current_profile.archive_on_change_only)
+        for signal_id, (signal_name, value) in samples.items():
+            sid = str(signal_id)
+            val = float(value)
+            if only_changes and not self._should_archive_signal_sample(sid, ts, val):
+                continue
+            rows.append((sid, str(signal_name), val))
+            self._archive_last_values[sid] = val
+            self._archive_last_written_ts[sid] = float(ts)
+        return rows
+
     def _on_samples_ready(self, ts: float, samples: dict[str, tuple[str, float]]) -> None:
         self._pending_render_samples.append((float(ts), samples))
         if len(self._pending_render_samples) > self._max_pending_render_batches:
@@ -5256,7 +5360,10 @@ class MainWindow(QMainWindow):
         if self._archive_store is None:
             return
 
-        rows = [(signal_id, signal_name, value) for signal_id, (signal_name, value) in samples.items()]
+        rows = self._filter_archive_rows(ts, samples)
+        if not rows:
+            self._last_archive_ts = ts
+            return
         self._archive_store.insert_batch(self.current_profile.id, ts, rows)
         self._last_archive_ts = ts
         self._prune_archive_retention_if_needed(ts)
