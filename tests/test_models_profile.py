@@ -34,6 +34,11 @@ class ProfileModelTests(unittest.TestCase):
         self.assertAlmostEqual(restored.archive_deadband, 0.25, places=6)
         self.assertEqual(restored.archive_keepalive_s, 90)
 
+    def test_explicit_empty_signals_are_preserved(self) -> None:
+        restored = ProfileConfig.from_dict({"signals": []})
+        self.assertEqual(restored.signals, [])
+
+
     def test_archive_change_only_fields_bounds(self) -> None:
         restored = ProfileConfig.from_dict(
             {

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import csv
@@ -10,7 +10,9 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -72,6 +74,18 @@ from .archive_bundle import (
 )
 from .startup import set_windows_autostart
 from .logging_utils import setup_logging
+from .recorder_shared import (
+    RECORDER_CONFIG_FORMAT,
+    RECORDER_CONFIG_PATH,
+    RECORDER_PID_PATH,
+    RECORDER_STATUS_PATH,
+    clear_recorder_pid,
+    is_pid_running,
+    read_recorder_pid,
+    read_recorder_status,
+    request_recorder_stop,
+    write_recorder_config,
+)
 from .version import APP_NAME, app_title
 
 
@@ -452,17 +466,20 @@ class MainWindow(QMainWindow):
                 archive_mode_text = "архив: изменения"
             else:
                 archive_mode_text = "архив: все точки"
+            render_mode_text = (
+                "график: вкл" if bool(getattr(self.current_profile, "render_chart_enabled", True)) else "график: выкл"
+            )
             if hasattr(self, "runtime_indicator_label"):
                 self.runtime_indicator_label.setStyleSheet(f"font-size: 12px; color: {indicator_color};")
             if hasattr(self, "runtime_status_label"):
                 self.runtime_status_label.setText(
-                    f"{indicator_text}, CPU {cpu_percent:.1f}%, RAM {mem_text}, Архив {archive_text}, {archive_mode_text}"
+                    f"{indicator_text}, CPU {cpu_percent:.1f}%, RAM {mem_text}, Архив {archive_text}, {archive_mode_text}, {render_mode_text}"
                 )
         except Exception:
             if hasattr(self, "runtime_indicator_label"):
                 self.runtime_indicator_label.setStyleSheet("font-size: 12px; color: #ef5350;")
             if hasattr(self, "runtime_status_label"):
-                self.runtime_status_label.setText("не подключено, CPU -, RAM -, Архив -")
+                self.runtime_status_label.setText("не подключено, CPU -, RAM -, Архив -, график -")
 
     def _on_archive_filter_settings_changed(self, *_args) -> None:
         if self._updating_ui:
@@ -651,11 +668,13 @@ class MainWindow(QMainWindow):
         self.add_signal_btn = QPushButton("+ Сигнал")
         self.copy_signal_btn = QPushButton("Копировать")
         self.remove_signal_btn = QPushButton("- Сигнал")
+        self.clear_signals_btn = QPushButton("Удалить все")
         self.save_signals_config_btn = QPushButton("Сохранить конфигурацию")
         self.signal_columns_btn = QPushButton("Колонки...")
         signal_buttons.addWidget(self.add_signal_btn)
         signal_buttons.addWidget(self.copy_signal_btn)
         signal_buttons.addWidget(self.remove_signal_btn)
+        signal_buttons.addWidget(self.clear_signals_btn)
         signal_buttons.addWidget(self.signal_columns_btn)
         signal_buttons.addStretch(1)
         signal_buttons.addWidget(self.save_signals_config_btn)
@@ -664,6 +683,7 @@ class MainWindow(QMainWindow):
         self.add_signal_btn.clicked.connect(self._on_add_signal_clicked)
         self.copy_signal_btn.clicked.connect(self._on_copy_signal_clicked)
         self.remove_signal_btn.clicked.connect(self._on_remove_signal_rows_clicked)
+        self.clear_signals_btn.clicked.connect(self._on_clear_signals_clicked)
         self.signal_columns_btn.clicked.connect(self._show_signal_columns_menu)
         self.save_signals_config_btn.clicked.connect(self._save_from_signals_window)
         self.signal_table.itemChanged.connect(self._on_signal_table_item_changed)
@@ -1383,6 +1403,7 @@ class MainWindow(QMainWindow):
         self._store_ui_to_profile(self.current_profile)
         self.app_config.active_profile_id = self.current_profile.id
         self.config_store.save(self.app_config)
+        self._save_recorder_config_snapshot(silent=True)
         self.status_label.setText("Статус: конфигурация (включая теги) сохранена")
 
     def _build_scales_window(self) -> None:
@@ -1701,6 +1722,16 @@ class MainWindow(QMainWindow):
         self.action_stop = QAction("Стоп опроса", self)
         self.action_stop.triggered.connect(self._stop_worker)
         mode_menu.addAction(self.action_stop)
+        mode_menu.addSeparator()
+        self.action_recorder_start = QAction("Старт внешнего регистратора", self)
+        self.action_recorder_start.triggered.connect(self._start_external_recorder)
+        mode_menu.addAction(self.action_recorder_start)
+        self.action_recorder_stop = QAction("Стоп внешнего регистратора", self)
+        self.action_recorder_stop.triggered.connect(self._stop_external_recorder)
+        mode_menu.addAction(self.action_recorder_stop)
+        self.action_recorder_status = QAction("Статус регистратора...", self)
+        self.action_recorder_status.triggered.connect(self._show_external_recorder_status)
+        mode_menu.addAction(self.action_recorder_status)
 
         archive_menu = menu_bar.addMenu("Архив")
         self.action_archive_write_db = QAction("Писать в БД", self, checkable=True)
@@ -1778,6 +1809,126 @@ class MainWindow(QMainWindow):
         mode = str(self.mode_combo.currentData() or "online")
         self.action_mode_online.setChecked(mode == "online")
         self.action_mode_offline.setChecked(mode == "offline")
+
+    def _build_recorder_config_payload(self) -> dict:
+        return {
+            "format": RECORDER_CONFIG_FORMAT,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "active_profile_id": self.current_profile.id,
+            "profile": copy.deepcopy(self.current_profile.to_dict()),
+            "source": "viewer_configurator",
+        }
+
+    def _save_recorder_config_snapshot(self, silent: bool = True) -> bool:
+        try:
+            payload = self._build_recorder_config_payload()
+            write_recorder_config(payload)
+            return True
+        except Exception as exc:
+            if not silent:
+                self.status_label.setText(f"Ошибка сохранения конфигурации регистратора: {exc}")
+            return False
+
+    def _external_recorder_command(self) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--recorder"]
+        main_path = Path(__file__).resolve().parents[1] / "main.py"
+        return [sys.executable, str(main_path), "--recorder"]
+
+    def _start_external_recorder(self, _checked: bool = False) -> None:
+        self._store_ui_to_profile(self.current_profile)
+        if not self._save_recorder_config_snapshot(silent=False):
+            return
+
+        pid = read_recorder_pid()
+        if is_pid_running(pid):
+            self.status_label.setText(f"Статус: внешний регистратор уже запущен (PID {pid})")
+            return
+
+        cmd = self._external_recorder_command()
+        kwargs: dict[str, object] = {
+            "cwd": str(Path.cwd()),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+
+        try:
+            subprocess.Popen(cmd, **kwargs)
+        except Exception as exc:
+            self.status_label.setText(f"Ошибка запуска внешнего регистратора: {exc}")
+            return
+
+        time.sleep(0.6)
+        pid = read_recorder_pid()
+        if is_pid_running(pid):
+            self.status_label.setText(f"Статус: внешний регистратор запущен (PID {pid})")
+        else:
+            self.status_label.setText("Статус: запуск регистратора выполнен, ожидание статуса")
+
+    def _stop_external_recorder(self, _checked: bool = False) -> None:
+        pid = read_recorder_pid()
+        if not is_pid_running(pid):
+            clear_recorder_pid()
+            self.status_label.setText("Статус: внешний регистратор не запущен")
+            return
+
+        try:
+            request_recorder_stop()
+        except Exception as exc:
+            self.status_label.setText(f"Ошибка отправки команды остановки: {exc}")
+            return
+
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            if not is_pid_running(pid):
+                clear_recorder_pid()
+                self.status_label.setText("Статус: внешний регистратор остановлен")
+                return
+            time.sleep(0.2)
+
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False, capture_output=True)
+            else:
+                os.kill(int(pid), signal.SIGTERM)
+        except Exception as exc:
+            self.status_label.setText(f"Ошибка принудительной остановки регистратора: {exc}")
+            return
+
+        clear_recorder_pid()
+        self.status_label.setText("Статус: внешний регистратор принудительно остановлен")
+
+    def _show_external_recorder_status(self, _checked: bool = False) -> None:
+        payload = read_recorder_status() or {}
+        if not payload:
+            payload = {
+                "state": "unknown",
+                "message": "статус регистратора недоступен",
+                "status_path": str(RECORDER_STATUS_PATH),
+                "config_path": str(RECORDER_CONFIG_PATH),
+                "pid_path": str(RECORDER_PID_PATH),
+            }
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Статус внешнего регистратора")
+        dialog.resize(860, 560)
+        layout = QVBoxLayout(dialog)
+        edit = QPlainTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
+        layout.addWidget(edit, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _on_action_auto_x_toggled(self, checked: bool) -> None:
         state = bool(checked)
@@ -2524,7 +2675,7 @@ class MainWindow(QMainWindow):
             address = 0
         return address, max(0, min(15, int(fallback_bit)))
 
-    def _store_ui_to_profile(self, profile: ProfileConfig) -> None:
+    def _store_ui_to_profile(self, profile: ProfileConfig, ensure_signal_minimum: bool = False) -> None:
         profile.name = self.profile_name_edit.text().strip() or profile.name
         profile.ip = self.ip_edit.text().strip() or "127.0.0.1"
         profile.port = self.port_spin.value()
@@ -2556,7 +2707,7 @@ class MainWindow(QMainWindow):
         profile.tags_poll_interval_ms = max(100, int(self.tags_poll_interval_spin.value()))
         if not profile.db_path:
             profile.db_path = str(DEFAULT_DB_PATH)
-        profile.signals = self._collect_signal_table()
+        profile.signals = self._collect_signal_table(ensure_signal_minimum=ensure_signal_minimum)
         profile.tag_tabs = self._collect_tags_tabs()
         profile.tags = self._clone_tag_list(profile.tag_tabs[0].tags) if profile.tag_tabs else []
         self._capture_ui_state(profile)
@@ -3070,7 +3221,77 @@ class MainWindow(QMainWindow):
         for row in selected:
             self.signal_table.removeRow(row)
 
-    def _collect_signal_table(self) -> list[SignalConfig]:
+    def _signal_ids_from_signal_table(self) -> set[str]:
+        signal_ids: set[str] = set()
+        for row in range(self.signal_table.rowCount()):
+            name_item = self.signal_table.item(row, 1)
+            if name_item is None:
+                continue
+            signal_id = str(name_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if signal_id:
+                signal_ids.add(signal_id)
+        return signal_ids
+
+    def _delete_signals_archive_history(self, signal_ids: set[str]) -> tuple[int, int]:
+        ids = sorted({str(item).strip() for item in signal_ids if str(item).strip()})
+        if not ids:
+            return 0, 0
+
+        db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
+        if not db_path.exists():
+            return 0, 0
+
+        store = ArchiveStore(str(db_path))
+        try:
+            return store.delete_signals(self.current_profile.id, ids, vacuum=True)
+        finally:
+            store.close()
+
+    def _on_clear_signals_clicked(self, _checked: bool = False) -> None:
+        if self.signal_table.rowCount() <= 0 and not self.current_profile.signals:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Сигналы графика",
+            "Удалить все сигналы из таблицы и очистить их архивную историю?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        mode = str(self.mode_combo.currentData() or "online")
+        was_running = bool(self._worker is not None and self._worker.isRunning())
+        if was_running:
+            self._stop_worker()
+
+        removed_ids = self._signal_ids_from_signal_table()
+        removed_ids.update(str(sig.id).strip() for sig in self.current_profile.signals if str(sig.id).strip())
+
+        removed_samples = 0
+        removed_meta = 0
+        cleanup_error: Exception | None = None
+        try:
+            removed_samples, removed_meta = self._delete_signals_archive_history(removed_ids)
+        except Exception as exc:
+            cleanup_error = exc
+
+        self.signal_table.setRowCount(0)
+        self._fit_signal_table_columns(initial=False)
+        self._apply_current_profile(ensure_signal_minimum=False)
+
+        if was_running and mode == "online":
+            self._start_worker()
+
+        if cleanup_error is None:
+            self.status_label.setText(
+                f"Статус: все сигналы удалены, очищено {removed_samples} точек и {removed_meta} записей метаданных"
+            )
+        else:
+            self.status_label.setText(f"Статус: сигналы удалены, но очистка архива не выполнена: {cleanup_error}")
+
+    def _collect_signal_table(self, ensure_signal_minimum: bool = False) -> list[SignalConfig]:
         signals: list[SignalConfig] = []
         seen_ids: set[str] = set()
         for row in range(self.signal_table.rowCount()):
@@ -3140,7 +3361,7 @@ class MainWindow(QMainWindow):
                 )
             )
 
-        if not signals:
+        if not signals and ensure_signal_minimum:
             signals.append(SignalConfig(name="Signal 1", address=0))
         return signals
 
@@ -3198,8 +3419,8 @@ class MainWindow(QMainWindow):
         self._populate_profiles()
         self._load_profile_to_ui(self.current_profile)
 
-    def _apply_current_profile(self) -> None:
-        self._store_ui_to_profile(self.current_profile)
+    def _apply_current_profile(self, ensure_signal_minimum: bool = False) -> None:
+        self._store_ui_to_profile(self.current_profile, ensure_signal_minimum=ensure_signal_minimum)
         current_name = self.current_profile.name
         combo_index = self.profile_combo.currentIndex()
         self.profile_combo.setItemText(combo_index, current_name)
@@ -3223,6 +3444,7 @@ class MainWindow(QMainWindow):
         else:
             self._apply_work_mode_ui(mode)
 
+        self._save_recorder_config_snapshot(silent=True)
         if mode == "online":
             self.status_label.setText("Статус: настройки применены")
         else:
@@ -3234,6 +3456,7 @@ class MainWindow(QMainWindow):
         self._store_ui_to_profile(self.current_profile)
         self.app_config.active_profile_id = self.current_profile.id
         self.config_store.save(self.app_config)
+        self._save_recorder_config_snapshot(silent=True)
         self.status_label.setText("Статус: конфигурация сохранена")
 
     def _export_chart_image(self, _checked: bool = False) -> None:
@@ -4016,6 +4239,7 @@ class MainWindow(QMainWindow):
                 self._render_timer.stop()
             self.chart.set_connection_events([])
             self.chart.clear_data()
+        self._update_runtime_status_panel()
         if not self._updating_ui:
             self._mark_config_dirty()
 
@@ -5600,4 +5824,3 @@ def run_app() -> None:
         window.setWindowIcon(icon)
     window.showMaximized()
     app.exec()
-

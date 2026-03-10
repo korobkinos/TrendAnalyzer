@@ -1,10 +1,19 @@
-# Trend Analyzer v1.1.13
+# Trend Analyzer v1.2.1
 
 Приложение для онлайн/офлайн анализа технологических сигналов с Modbus TCP, архивом и печатью графиков.
 
+Начиная с версии `1.2.0` поддерживается разделение на две роли:
+- `Viewer/Configurator` (основной UI: графики, теги, анализ, настройка),
+- `Recorder` (внешний фоновый регистратор, пишет в БД независимо от UI).
+
+С версии `1.2.1` добавлен отдельный `Tray Recorder`:
+- работает в системном трее без главного окна,
+- может автоматически запускать/останавливать фоновый Recorder,
+- позволяет открыть UI-конфигуратор по требованию.
+
 ## Основные возможности
 
-- Опрос Modbus TCP в отдельном потоке.
+- Опрос Modbus TCP.
 - Несколько сигналов на одном графике.
 - Несколько шкал Y с привязкой сигналов.
 - Курсор и анализ участка графика.
@@ -14,6 +23,10 @@
   - запись только при изменении (`deadband`, `keepalive`).
 - Профили настроек, автозагрузка профиля.
 - Автозапуск с Windows и автоподключение.
+- Внешний регистратор:
+  - запуск/останов из UI,
+  - отдельный статус регистратора,
+  - запись продолжается без зависимости от окна графиков.
 - Сборка portable EXE (one-file).
 
 ## Быстрый запуск (из исходников)
@@ -22,18 +35,47 @@
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+Viewer/Configurator:
+
+```bash
 python main.py
 ```
 
+Recorder (фоновый режим):
+
+```bash
+python main.py --recorder
+```
+
+Tray Recorder (иконка в трее):
+
+```bash
+python main.py --recorder-tray
+```
+
+В tray-режиме:
+- запись запускается автоматически при старте tray-приложения,
+- доступны действия `Старт записи`, `Стоп записи`, `Статус регистратора...`,
+- пункт `Открыть интерфейс настройки` поднимает обычный UI-конфигуратор.
+
 ## Где хранятся данные
 
-- Конфигурация: `~/.trend_analyzer/config.json`
+- Конфигурация UI/профилей: `~/.trend_analyzer/config.json`
 - Архив SQLite: `~/.trend_analyzer/archive.db`
+- Конфиг внешнего регистратора: `~/.trend_analyzer/recorder_config.json`
+- Статус внешнего регистратора: `~/.trend_analyzer/recorder_status.json`
+- Команда управления регистратором: `~/.trend_analyzer/recorder_control.json`
+- PID внешнего регистратора: `~/.trend_analyzer/recorder.pid`
 
 Для portable EXE (`dist\TrendAnalyzer.exe`):
 
 - `data\config.json` рядом с `exe`
 - `data\archive.db` рядом с `exe`
+- `data\recorder_config.json` рядом с `exe`
+- `data\recorder_status.json` рядом с `exe`
+- `data\recorder_control.json` рядом с `exe`
 
 ## Сборка portable EXE
 

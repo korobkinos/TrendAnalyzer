@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 import json
@@ -252,6 +252,40 @@ class ArchiveStore:
         self._pending_rows = 0
         self._last_commit_ts = time.monotonic()
         return int(cur_samples.rowcount or 0), int(cur_conn.rowcount or 0)
+
+    def delete_signals(self, profile_id: str, signal_ids: Iterable[str], vacuum: bool = False) -> tuple[int, int]:
+        ids = [str(item).strip() for item in signal_ids if str(item).strip()]
+        if not ids:
+            return 0, 0
+
+        # Persist pending inserts first, otherwise a later commit could re-add
+        # rows that were expected to be removed.
+        self.flush()
+
+        removed_samples = self._delete_signals_from_table("samples", profile_id, ids)
+        removed_meta = self._delete_signals_from_table("signals_meta", profile_id, ids)
+        self._conn.commit()
+        self._pending_rows = 0
+        self._last_commit_ts = time.monotonic()
+
+        if vacuum and (removed_samples > 0 or removed_meta > 0):
+            self._conn.execute("VACUUM")
+
+        return removed_samples, removed_meta
+
+    def _delete_signals_from_table(self, table_name: str, profile_id: str, signal_ids: list[str]) -> int:
+        if not signal_ids or not self._table_exists(table_name):
+            return 0
+
+        total_removed = 0
+        chunk_size = 300
+        for start in range(0, len(signal_ids), chunk_size):
+            chunk = signal_ids[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"DELETE FROM {table_name} WHERE profile_id = ? AND signal_id IN ({placeholders})"
+            cursor = self._conn.execute(sql, [profile_id, *chunk])
+            total_removed += int(cursor.rowcount or 0)
+        return total_removed
 
     def _commit_if_needed(self, force: bool = False) -> None:
         if self._pending_rows <= 0 and not force:

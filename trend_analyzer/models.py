@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 import uuid
@@ -200,8 +200,8 @@ class ProfileConfig:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ProfileConfig":
-        signals_raw = payload.get("signals") or []
-        signals = [SignalConfig.from_dict(item) for item in signals_raw]
+        signals_raw = payload.get("signals")
+        signals = [SignalConfig.from_dict(item) for item in signals_raw] if isinstance(signals_raw, list) else []
         tags_raw = payload.get("tags") or []
         tags = [TagConfig.from_dict(item) for item in tags_raw]
         tag_tabs_raw = payload.get("tag_tabs") or []
@@ -211,7 +211,7 @@ class ProfileConfig:
         if not tag_tabs:
             tag_tabs = [TagTabConfig(name="Вкладка 1", tags=[])]
         legacy_tags = [TagConfig.from_dict(item.to_dict()) for item in tag_tabs[0].tags] if tag_tabs else tags
-        if not signals:
+        if signals_raw is None and not signals:
             signals = [SignalConfig(name="Signal 1", address=0)]
         work_mode = str(payload.get("work_mode") or "online")
         if work_mode not in {"online", "offline"}:

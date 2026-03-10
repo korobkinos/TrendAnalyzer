@@ -1,5 +1,37 @@
-﻿# Changelog
+# Changelog
 Все значимые изменения проекта фиксируются в этом файле.
+## [1.2.1] - 2026-03-10
+### Added
+- Added dedicated tray recorder mode (`main.py --recorder-tray`) with no main window.
+- Added tray menu actions: start/stop recording, open recorder status, and open viewer/configurator UI.
+- Added separate Windows autostart registration for tray recorder (`TrendAnalyzerRecorder`).
+
+### Changed
+- `main.py` now supports three launch roles: UI, headless recorder, and tray recorder.
+- Startup command builder now supports additional CLI args for autostart scenarios.
+- Added startup-command unit tests for default and arg-based autostart command generation.
+
+## [1.2.0] - 2026-03-10
+### Added
+- Added external recorder runtime (`main.py --recorder`) for long-running archive writes independent from UI rendering.
+- Added recorder IPC files in app data (`recorder_config.json`, `recorder_status.json`, `recorder_control.json`, `recorder.pid`).
+- Added UI actions in `Режим`: start/stop external recorder and recorder status dialog.
+
+### Changed
+- Viewer now acts as recorder configurator: save/apply writes active profile snapshot to recorder config.
+- `ProfileConfig.from_dict` now preserves explicitly empty `signals` list (no forced placeholder signal when `signals: []`).
+- Added tests for archive signal cleanup and explicit-empty-signals behavior.
+
+## [1.1.15] - 2026-03-10
+### Changed
+- Added `Удалить все` button in `Сигналы графика` window.
+- `Удалить все` now removes all signals from profile without auto-restoring a placeholder signal.
+- Added archive cleanup for removed signals: deletes related rows from `samples` and `signals_meta` (with `VACUUM`), reducing DB bloat.
+
+## [1.1.14] - 2026-03-10
+### Changed
+- Runtime status line now also shows chart render mode: `график: вкл` / `график: выкл`.
+- Added immediate runtime-status refresh when `Отрисовка графика` is toggled.
 
 ## [1.1.13] - 2026-03-09
 ### Changed

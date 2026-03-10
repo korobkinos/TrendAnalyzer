@@ -54,6 +54,38 @@ class ArchiveStoreSchemaTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_delete_signals_removes_samples_and_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "archive_delete.db"
+            store = ArchiveStore(str(db_path))
+            store.insert_batch(
+                "profile-1",
+                1000.0,
+                [
+                    ("sig-1", "Signal 1", 1.0),
+                    ("sig-2", "Signal 2", 2.0),
+                    ("sig-3", "Signal 3", 3.0),
+                ],
+            )
+            removed_samples, removed_meta = store.delete_signals("profile-1", ["sig-2", "sig-3"], vacuum=False)
+            self.assertEqual(removed_samples, 2)
+            self.assertEqual(removed_meta, 2)
+
+            store.close()
+
+            conn = sqlite3.connect(db_path)
+            try:
+                remaining_samples = int(
+                    conn.execute("SELECT COUNT(*) FROM samples WHERE profile_id = ?", ("profile-1",)).fetchone()[0]
+                )
+                self.assertEqual(remaining_samples, 1)
+                remaining_meta = int(
+                    conn.execute("SELECT COUNT(*) FROM signals_meta WHERE profile_id = ?", ("profile-1",)).fetchone()[0]
+                )
+                self.assertEqual(remaining_meta, 1)
+            finally:
+                conn.close()
+
     def test_legacy_samples_table_is_recreated_without_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "archive_legacy.db"
