@@ -1,5 +1,26 @@
 # Changelog
 Все значимые изменения проекта фиксируются в этом файле.
+## [1.3.0] - 2026-03-10
+### Changed
+- Switched online workflow to single-source architecture:
+  - external recorder is the only Modbus poller/writer,
+  - UI online mode now renders live data tail from SQLite archive (`samples` + `connection_events`).
+- `Старт` action in UI now starts DB-live viewing and auto-starts external recorder if it is not running.
+- Removed runtime dependence on in-process online polling for chart updates.
+- Updated menu labels for clarity: `Старт просмотра (из БД)` and `Стоп просмотра`.
+
+## [1.2.2] - 2026-03-10
+### Changed
+- Reworked top menu structure for faster navigation and reduced clutter.
+- Replaced `Сеанс` naming with `Управление`.
+- Grouped actions by intent:
+  - `Управление` (режим, опрос, внешний регистратор),
+  - `Окна` (все рабочие окна, включая статистику),
+  - `Архив и экспорт`,
+  - `Вид`,
+  - `Приложение` (трей, поведение закрытия, автозапуск, выход).
+- Removed always-visible UI diagnostics action from the regular user menu.
+
 ## [1.2.1] - 2026-03-10
 ### Added
 - Added dedicated tray recorder mode (`main.py --recorder-tray`) with no main window.

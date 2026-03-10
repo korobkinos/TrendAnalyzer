@@ -147,6 +147,10 @@ class MainWindow(QMainWindow):
         self._tray_icon: QSystemTrayIcon | None = None
         self._worker: ModbusWorker | None = None
         self._archive_store: ArchiveStore | None = None
+        self._db_live_conn: sqlite3.Connection | None = None
+        self._db_live_running = False
+        self._db_live_last_sample_row_id = 0
+        self._db_live_last_connection_event_row_id = 0
         self._last_archive_ts = 0.0
         self._last_retention_cleanup_ts = 0.0
         self._archive_last_values: dict[str, float] = {}
@@ -169,6 +173,10 @@ class MainWindow(QMainWindow):
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(False)
         self._render_timer.timeout.connect(self._flush_pending_render_samples)
+        self._db_live_timer = QTimer(self)
+        self._db_live_timer.setSingleShot(False)
+        self._db_live_timer.setInterval(300)
+        self._db_live_timer.timeout.connect(self._poll_db_live_stream)
         self._pending_render_samples: list[tuple[float, dict[str, tuple[str, float]]]] = []
         # Backpressure cap for UI queue to avoid high RAM usage when UI redraw
         # cannot keep up with very fast polling / many signals.
@@ -1654,86 +1662,59 @@ class MainWindow(QMainWindow):
     def _build_menu_bar(self) -> None:
         menu_bar = self.menuBar()
 
-        file_menu = menu_bar.addMenu("Файл")
-        self.action_save_config = QAction("Сохранить конфигурацию", self)
-        self.action_save_config.triggered.connect(self._save_config)
-        file_menu.addAction(self.action_save_config)
-        self.action_export_connection_config = QAction("Экспорт подключения...", self)
-        self.action_export_connection_config.triggered.connect(self._save_connection_config_to_file)
-        file_menu.addAction(self.action_export_connection_config)
-        self.action_import_connection_config = QAction("Импорт подключения...", self)
-        self.action_import_connection_config.triggered.connect(self._load_connection_config_from_file)
-        file_menu.addAction(self.action_import_connection_config)
-        file_menu.addSeparator()
-        export_menu = file_menu.addMenu("Экспорт и печать")
-        self.action_export_chart_image = QAction("График в PNG/JPG...", self)
-        self.action_export_chart_image.triggered.connect(self._export_chart_image)
-        export_menu.addAction(self.action_export_chart_image)
-        self.action_export_chart_csv = QAction("Данные графика в CSV...", self)
-        self.action_export_chart_csv.triggered.connect(self._export_chart_csv)
-        export_menu.addAction(self.action_export_chart_csv)
-        self.action_print_chart = QAction("Печать графика...", self)
-        self.action_print_chart.triggered.connect(self._print_chart)
-        export_menu.addAction(self.action_print_chart)
-        file_menu.addSeparator()
-        self.action_minimize_tray = QAction("Свернуть в трей", self)
-        self.action_minimize_tray.triggered.connect(self._minimize_to_tray)
-        file_menu.addAction(self.action_minimize_tray)
-        file_menu.addSeparator()
-        self.action_exit = QAction("Выход", self)
-        self.action_exit.triggered.connect(self._exit_from_tray)
-        file_menu.addAction(self.action_exit)
-
-        settings_menu = menu_bar.addMenu("Настройки")
-        self.action_connection = QAction("Подключение...", self)
-        self.action_connection.triggered.connect(lambda: self._show_tool_window(self.connection_window))
-        settings_menu.addAction(self.action_connection)
-
-        self.action_signals = QAction("Сигналы графика...", self)
-        self.action_signals.triggered.connect(lambda: self._show_tool_window(self.signals_window))
-        settings_menu.addAction(self.action_signals)
-
-        self.action_tags = QAction("Регистры Modbus...", self)
-        self.action_tags.triggered.connect(lambda: self._show_tool_window(self.tags_window))
-        settings_menu.addAction(self.action_tags)
-
-        self.action_scales = QAction("Шкалы...", self)
-        self.action_scales.triggered.connect(lambda: self._show_tool_window(self.scales_window))
-        settings_menu.addAction(self.action_scales)
-        self.action_graph_settings = QAction("График...", self)
-        self.action_graph_settings.triggered.connect(lambda: self._show_tool_window(self.graph_settings_window))
-        settings_menu.addAction(self.action_graph_settings)
-
-        mode_menu = menu_bar.addMenu("Режим")
-        self.action_mode_online = QAction("Онлайн", self, checkable=True)
-        self.action_mode_offline = QAction("Офлайн", self, checkable=True)
+        control_menu = menu_bar.addMenu("Управление")
+        self.action_mode_online = QAction("Режим: Онлайн", self, checkable=True)
+        self.action_mode_offline = QAction("Режим: Офлайн", self, checkable=True)
         self.mode_action_group = QActionGroup(self)
         self.mode_action_group.setExclusive(True)
         self.mode_action_group.addAction(self.action_mode_online)
         self.mode_action_group.addAction(self.action_mode_offline)
         self.action_mode_online.triggered.connect(lambda checked: self._set_mode_via_menu("online", checked))
         self.action_mode_offline.triggered.connect(lambda checked: self._set_mode_via_menu("offline", checked))
-        mode_menu.addAction(self.action_mode_online)
-        mode_menu.addAction(self.action_mode_offline)
-        mode_menu.addSeparator()
-        self.action_start = QAction("Старт опроса", self)
+        control_menu.addAction(self.action_mode_online)
+        control_menu.addAction(self.action_mode_offline)
+        control_menu.addSeparator()
+        self.action_start = QAction("Старт просмотра (из БД)", self)
         self.action_start.triggered.connect(self._start_worker)
-        mode_menu.addAction(self.action_start)
-        self.action_stop = QAction("Стоп опроса", self)
+        control_menu.addAction(self.action_start)
+        self.action_stop = QAction("Стоп просмотра", self)
         self.action_stop.triggered.connect(self._stop_worker)
-        mode_menu.addAction(self.action_stop)
-        mode_menu.addSeparator()
+        control_menu.addAction(self.action_stop)
+        control_menu.addSeparator()
         self.action_recorder_start = QAction("Старт внешнего регистратора", self)
         self.action_recorder_start.triggered.connect(self._start_external_recorder)
-        mode_menu.addAction(self.action_recorder_start)
+        control_menu.addAction(self.action_recorder_start)
         self.action_recorder_stop = QAction("Стоп внешнего регистратора", self)
         self.action_recorder_stop.triggered.connect(self._stop_external_recorder)
-        mode_menu.addAction(self.action_recorder_stop)
+        control_menu.addAction(self.action_recorder_stop)
         self.action_recorder_status = QAction("Статус регистратора...", self)
         self.action_recorder_status.triggered.connect(self._show_external_recorder_status)
-        mode_menu.addAction(self.action_recorder_status)
+        control_menu.addAction(self.action_recorder_status)
 
-        archive_menu = menu_bar.addMenu("Архив")
+        windows_menu = menu_bar.addMenu("Окна")
+        self.action_connection = QAction("Подключение...", self)
+        self.action_connection.triggered.connect(lambda: self._show_tool_window(self.connection_window))
+        windows_menu.addAction(self.action_connection)
+
+        self.action_signals = QAction("Сигналы графика...", self)
+        self.action_signals.triggered.connect(lambda: self._show_tool_window(self.signals_window))
+        windows_menu.addAction(self.action_signals)
+
+        self.action_tags = QAction("Регистры Modbus...", self)
+        self.action_tags.triggered.connect(lambda: self._show_tool_window(self.tags_window))
+        windows_menu.addAction(self.action_tags)
+
+        self.action_scales = QAction("Шкалы...", self)
+        self.action_scales.triggered.connect(lambda: self._show_tool_window(self.scales_window))
+        windows_menu.addAction(self.action_scales)
+        self.action_graph_settings = QAction("График...", self)
+        self.action_graph_settings.triggered.connect(lambda: self._show_tool_window(self.graph_settings_window))
+        windows_menu.addAction(self.action_graph_settings)
+        self.action_statistics = QAction("Статистика...", self)
+        self.action_statistics.triggered.connect(self._show_statistics_window)
+        windows_menu.addAction(self.action_statistics)
+
+        archive_menu = menu_bar.addMenu("Архив и экспорт")
         self.action_archive_write_db = QAction("Писать в БД", self, checkable=True)
         self.action_archive_write_db.setChecked(True)
         self.action_archive_write_db.triggered.connect(self._on_archive_write_db_toggled)
@@ -1745,6 +1726,23 @@ class MainWindow(QMainWindow):
         self.action_load_archive = QAction("Загрузить архив...", self)
         self.action_load_archive.triggered.connect(self._load_archive_from_file)
         archive_menu.addAction(self.action_load_archive)
+        archive_menu.addSeparator()
+        self.action_export_chart_image = QAction("График в PNG/JPG...", self)
+        self.action_export_chart_image.triggered.connect(self._export_chart_image)
+        archive_menu.addAction(self.action_export_chart_image)
+        self.action_export_chart_csv = QAction("Данные графика в CSV...", self)
+        self.action_export_chart_csv.triggered.connect(self._export_chart_csv)
+        archive_menu.addAction(self.action_export_chart_csv)
+        self.action_print_chart = QAction("Печать графика...", self)
+        self.action_print_chart.triggered.connect(self._print_chart)
+        archive_menu.addAction(self.action_print_chart)
+        archive_menu.addSeparator()
+        self.action_export_connection_config = QAction("Экспорт подключения...", self)
+        self.action_export_connection_config.triggered.connect(self._save_connection_config_to_file)
+        archive_menu.addAction(self.action_export_connection_config)
+        self.action_import_connection_config = QAction("Импорт подключения...", self)
+        self.action_import_connection_config.triggered.connect(self._load_connection_config_from_file)
+        archive_menu.addAction(self.action_import_connection_config)
 
         view_menu = menu_bar.addMenu("Вид")
         self.action_auto_x = QAction("Авто X", self, checkable=True)
@@ -1758,16 +1756,22 @@ class MainWindow(QMainWindow):
         self.action_reset_zoom = QAction("Сброс масштаба", self)
         self.action_reset_zoom.triggered.connect(lambda _checked=False: self.chart.reset_view())
         view_menu.addAction(self.action_reset_zoom)
-        self.action_statistics = QAction("Статистика...", self)
-        self.action_statistics.triggered.connect(self._show_statistics_window)
-        view_menu.addAction(self.action_statistics)
         view_menu.addSeparator()
         self.action_values_panel = QAction("Таблица значений", self, checkable=True)
         self.action_values_panel.setChecked(True)
         self.action_values_panel.triggered.connect(self._on_values_panel_menu_toggled)
         view_menu.addAction(self.action_values_panel)
 
-        close_menu = menu_bar.addMenu("Параметры")
+        app_menu = menu_bar.addMenu("Приложение")
+        self.action_save_config = QAction("Сохранить конфигурацию", self)
+        self.action_save_config.triggered.connect(self._save_config)
+        app_menu.addAction(self.action_save_config)
+        app_menu.addSeparator()
+        self.action_minimize_tray = QAction("Свернуть в трей", self)
+        self.action_minimize_tray.triggered.connect(self._minimize_to_tray)
+        app_menu.addAction(self.action_minimize_tray)
+        app_menu.addSeparator()
+        close_menu = app_menu.addMenu("При закрытии")
         self.action_close_ask = QAction("При закрытии: запрашивать действие", self, checkable=True)
         self.action_close_to_tray = QAction("При закрытии: сворачивать в трей", self, checkable=True)
         self.action_close_exit = QAction("При закрытии: завершать программу", self, checkable=True)
@@ -1783,14 +1787,14 @@ class MainWindow(QMainWindow):
         close_menu.addSeparator()
         self.action_windows_autostart = QAction("Автозапуск при старте Windows", self, checkable=True)
         self.action_windows_autostart.triggered.connect(self._on_action_windows_autostart_toggled)
-        close_menu.addAction(self.action_windows_autostart)
-        self.action_auto_connect_startup = QAction("Автозапуск опроса при запуске", self, checkable=True)
+        app_menu.addAction(self.action_windows_autostart)
+        self.action_auto_connect_startup = QAction("Автостарт просмотра при запуске", self, checkable=True)
         self.action_auto_connect_startup.triggered.connect(self._on_action_auto_connect_startup_toggled)
-        close_menu.addAction(self.action_auto_connect_startup)
-        close_menu.addSeparator()
-        self.action_show_ui_state = QAction("Диагностика: состояние интерфейса (ui_state)", self)
-        self.action_show_ui_state.triggered.connect(self._show_ui_state_debug_dialog)
-        close_menu.addAction(self.action_show_ui_state)
+        app_menu.addAction(self.action_auto_connect_startup)
+        app_menu.addSeparator()
+        self.action_exit = QAction("Выход", self)
+        self.action_exit.triggered.connect(self._exit_from_tray)
+        app_menu.addAction(self.action_exit)
 
     @staticmethod
     def _show_tool_window(window: QDialog) -> None:
@@ -2102,7 +2106,7 @@ class MainWindow(QMainWindow):
     def _on_action_auto_connect_startup_toggled(self, checked: bool) -> None:
         self.app_config.auto_connect_on_launch = bool(checked)
         self.config_store.save(self.app_config)
-        self.status_label.setText("Статус: автоподключение обновлено")
+        self.status_label.setText("Статус: автостарт просмотра обновлен")
 
     def _auto_connect_startup_if_needed(self) -> None:
         if not bool(self.app_config.auto_connect_on_launch):
@@ -2145,9 +2149,9 @@ class MainWindow(QMainWindow):
         tray_menu = QMenu()
         action_open = tray_menu.addAction("Открыть")
         action_open.triggered.connect(self._restore_from_tray)
-        action_start = tray_menu.addAction("Старт")
+        action_start = tray_menu.addAction("Старт просмотра")
         action_start.triggered.connect(self._start_worker)
-        action_stop = tray_menu.addAction("Стоп")
+        action_stop = tray_menu.addAction("Стоп просмотра")
         action_stop.triggered.connect(self._stop_worker)
         tray_menu.addSeparator()
         action_exit = tray_menu.addAction("Выход")
@@ -3439,7 +3443,7 @@ class MainWindow(QMainWindow):
         # manual scale settings (AutoY/Min/Max) and other view preferences.
         self._apply_runtime_view_state(self.current_profile)
 
-        if mode == "online" and self._worker is not None and self._worker.isRunning():
+        if mode == "online" and self._is_live_stream_running():
             self._restart_worker()
         else:
             self._apply_work_mode_ui(mode)
@@ -4229,7 +4233,7 @@ class MainWindow(QMainWindow):
             if mode == "online":
                 auto_x_enabled = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True
                 self._load_recent_online_history_from_db(adjust_x_range=auto_x_enabled, silent=True)
-            if self._worker is not None and self._worker.isRunning():
+            if self._is_live_stream_running():
                 if not self._render_timer.isActive():
                     self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
                     self._render_timer.start()
@@ -4259,21 +4263,21 @@ class MainWindow(QMainWindow):
     def _apply_work_mode_ui(self, mode: str) -> None:
         online_mode = mode == "online"
 
-        if not online_mode and self._worker is not None and self._worker.isRunning():
+        if not online_mode and self._is_live_stream_running():
             self._stop_worker()
 
         self.archive_to_db_checkbox.setEnabled(online_mode)
         self.action_archive_write_db.setEnabled(online_mode)
-        self.action_start.setEnabled(online_mode and (self._worker is None or not self._worker.isRunning()))
-        self.action_stop.setEnabled(online_mode and self._worker is not None and self._worker.isRunning())
+        self.action_start.setEnabled(online_mode and not self._is_live_stream_running())
+        self.action_stop.setEnabled(online_mode and self._is_live_stream_running())
         self.action_mode_online.setChecked(online_mode)
         self.action_mode_offline.setChecked(not online_mode)
 
         if online_mode:
-            if self._worker is None or not self._worker.isRunning():
-                self.status_label.setText("Статус: онлайн режим, ожидание запуска")
+            if not self._is_live_stream_running():
+                self.status_label.setText("Статус: онлайн режим, ожидание запуска просмотра")
             else:
-                self.status_label.setText("Статус: онлайн режим, опрос запущен")
+                self.status_label.setText("Статус: онлайн режим, просмотр из БД запущен")
         else:
             self.status_label.setText("Статус: офлайн режим (архив)")
         self._update_runtime_status_panel()
@@ -5275,7 +5279,7 @@ class MainWindow(QMainWindow):
             return False
 
         gap_threshold = max(2.0, float(self.current_profile.poll_interval_ms) / 1000.0 * 2.5)
-        worker_running = self._worker is not None and self._worker.isRunning()
+        worker_running = self._is_live_stream_running()
         runtime_connected = bool(self._runtime_connected)
         can_infer_gap_disconnect = not (worker_running and runtime_connected)
         if can_infer_gap_disconnect and (now_ts - float(last_ts) > gap_threshold):
@@ -5298,6 +5302,174 @@ class MainWindow(QMainWindow):
             right_text = format_ts_ms(float(last_ts))
             self.status_label.setText(f"Статус: восстановлена история из БД ({left_text} .. {right_text})")
         return True
+
+    def _is_live_stream_running(self) -> bool:
+        return bool(self._db_live_running or (self._worker is not None and self._worker.isRunning()))
+
+    def _is_external_recorder_running(self) -> bool:
+        pid = read_recorder_pid()
+        return is_pid_running(pid)
+
+    def _close_db_live_connection(self) -> None:
+        if self._db_live_conn is None:
+            return
+        try:
+            self._db_live_conn.close()
+        except Exception:
+            pass
+        self._db_live_conn = None
+
+    def _open_db_live_connection(self) -> bool:
+        if self._db_live_conn is not None:
+            return True
+        db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
+        if not db_path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA busy_timeout=2000;")
+        except Exception:
+            self._db_live_conn = None
+            return False
+        self._db_live_conn = conn
+        return True
+
+    def _query_max_table_id(self, table_name: str) -> int:
+        if self._db_live_conn is None:
+            return 0
+        if table_name not in {"samples", "connection_events"}:
+            return 0
+        try:
+            row = self._db_live_conn.execute(
+                f"SELECT MAX(id) FROM {table_name} WHERE profile_id = ?",
+                (self.current_profile.id,),
+            ).fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+
+    def _bootstrap_db_live_cursors(self) -> None:
+        self._db_live_last_sample_row_id = self._query_max_table_id("samples")
+        self._db_live_last_connection_event_row_id = self._query_max_table_id("connection_events")
+
+    def _append_db_live_sample_rows(self, rows: list[tuple[int, str, float, float]]) -> None:
+        if not rows:
+            return
+
+        signal_name_by_id = {str(item.id): str(item.name) for item in self.current_profile.signals if str(item.id)}
+        batch: list[tuple[float, dict[str, tuple[str, float]]]] = []
+        current_ts: float | None = None
+        current_samples: dict[str, tuple[str, float]] = {}
+        for _row_id, signal_id, ts, value in rows:
+            sid = str(signal_id or "").strip()
+            if not sid:
+                continue
+            try:
+                ts_f = float(ts)
+                value_f = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if current_ts is None or abs(float(current_ts) - ts_f) > 1e-9:
+                if current_ts is not None and current_samples:
+                    batch.append((float(current_ts), current_samples))
+                current_ts = ts_f
+                current_samples = {}
+            current_samples[sid] = (signal_name_by_id.get(sid, sid), value_f)
+
+        if current_ts is not None and current_samples:
+            batch.append((float(current_ts), current_samples))
+        if not batch:
+            return
+
+        if bool(self.current_profile.render_chart_enabled):
+            self._pending_render_samples.extend(batch)
+            if len(self._pending_render_samples) > self._max_pending_render_batches:
+                self._pending_render_samples = self._pending_render_samples[-self._max_pending_render_batches :]
+            if not self._render_timer.isActive():
+                self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
+                self._render_timer.start()
+
+    def _append_db_live_connection_rows(self, rows: list[tuple[int, float, int]]) -> None:
+        if not rows:
+            return
+
+        for _row_id, ts, state in rows:
+            try:
+                ts_f = float(ts)
+                state_b = bool(int(state))
+            except (TypeError, ValueError):
+                continue
+
+            if self._last_connection_state is None or self._last_connection_state != state_b:
+                event = [ts_f, 1.0 if state_b else 0.0]
+                self._connection_events.append(event)
+                if bool(self.current_profile.render_chart_enabled):
+                    self.chart.add_connection_event(ts_f, state_b)
+                self._last_connection_state = state_b
+            self._runtime_connected = state_b
+
+    def _poll_db_live_stream(self) -> None:
+        if not self._db_live_running:
+            return
+        if str(self.mode_combo.currentData() or "online") != "online":
+            return
+
+        if not self._open_db_live_connection():
+            self._runtime_connected = False
+            self._update_runtime_status_panel()
+            return
+
+        conn = self._db_live_conn
+        if conn is None:
+            self._runtime_connected = False
+            self._update_runtime_status_panel()
+            return
+
+        try:
+            sample_rows = conn.execute(
+                """
+                SELECT id, signal_id, ts, value
+                FROM samples
+                WHERE profile_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT 12000
+                """,
+                (self.current_profile.id, int(self._db_live_last_sample_row_id)),
+            ).fetchall()
+            if sample_rows:
+                self._db_live_last_sample_row_id = int(sample_rows[-1][0])
+                self._append_db_live_sample_rows(sample_rows)
+
+            connection_rows = conn.execute(
+                """
+                SELECT id, ts, is_connected
+                FROM connection_events
+                WHERE profile_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT 4000
+                """,
+                (self.current_profile.id, int(self._db_live_last_connection_event_row_id)),
+            ).fetchall()
+            if connection_rows:
+                self._db_live_last_connection_event_row_id = int(connection_rows[-1][0])
+                self._append_db_live_connection_rows(connection_rows)
+        except Exception:
+            self._close_db_live_connection()
+            self._runtime_connected = False
+            self._update_runtime_status_panel()
+            return
+
+        if not self._is_external_recorder_running():
+            self._runtime_connected = False
+        else:
+            status_payload = read_recorder_status() or {}
+            if str(status_payload.get("profile_id") or "") == str(self.current_profile.id):
+                try:
+                    self._runtime_connected = bool(status_payload.get("connected", self._runtime_connected))
+                except Exception:
+                    pass
+        self._update_runtime_status_panel()
 
     def _record_shutdown_disconnect_event(self) -> None:
         if self._archive_store is None:
@@ -5329,27 +5501,20 @@ class MainWindow(QMainWindow):
 
         self._apply_current_profile()
 
-        if self._worker is not None and self._worker.isRunning():
+        if self._is_live_stream_running():
             return
 
-        if self._archive_store is not None:
-            self._archive_store.close()
-            self._archive_store = None
-        self._archive_last_values = {}
-        self._archive_last_written_ts = {}
-        self._signal_types_by_id = {}
+        if not self._is_external_recorder_running():
+            self._start_external_recorder()
+            if not self._is_external_recorder_running():
+                self.status_label.setText("Статус: не удалось запустить внешний регистратор")
+                return
 
-        if self.archive_to_db_checkbox.isChecked():
-            self._archive_store = ArchiveStore(self.current_profile.db_path or str(DEFAULT_DB_PATH))
-        else:
-            self._archive_store = None
-        self._last_archive_ts = 0.0
-        self._last_retention_cleanup_ts = 0.0
-        self._archive_last_values = {}
-        self._archive_last_written_ts = {}
-        self._signal_types_by_id = {
-            str(signal.id): str(signal.data_type or "int16") for signal in self.current_profile.signals if str(signal.id)
-        }
+        self._close_db_live_connection()
+        if not self._open_db_live_connection():
+            self.status_label.setText("Ошибка: не удалось открыть архив БД для live-просмотра")
+            return
+
         restored = False
         if bool(self.current_profile.render_chart_enabled):
             restored = self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
@@ -5357,24 +5522,32 @@ class MainWindow(QMainWindow):
             self._connection_events = []
             self._last_connection_state = None
             self.chart.set_connection_events([])
+        self._runtime_connected = bool(self._last_connection_state) if self._last_connection_state is not None else False
         if not bool(self.current_profile.render_chart_enabled):
             self.chart.clear_data()
         self._pending_render_samples = []
 
-        self._worker = ModbusWorker(copy.deepcopy(self.current_profile))
-        self._worker.samples_ready.connect(self._on_samples_ready)
-        self._worker.connection_changed.connect(self._on_connection_changed)
-        self._worker.error.connect(self._on_worker_error)
-        self._worker.start()
+        self._bootstrap_db_live_cursors()
+        self._db_live_running = True
+        self._db_live_timer.setInterval(max(120, min(2000, int(self.current_profile.poll_interval_ms))))
+        if not self._db_live_timer.isActive():
+            self._db_live_timer.start()
+
         self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
         if bool(self.current_profile.render_chart_enabled) and not self._render_timer.isActive():
             self._render_timer.start()
 
         self.action_start.setEnabled(False)
         self.action_stop.setEnabled(True)
-        self.status_label.setText("Статус: опрос запущен (ожидание связи)")
+        self._poll_db_live_stream()
+        self.status_label.setText("Статус: просмотр из БД запущен")
 
     def _stop_worker(self) -> None:
+        if self._db_live_timer.isActive():
+            self._db_live_timer.stop()
+        self._db_live_running = False
+        self._close_db_live_connection()
+
         if self._worker is not None:
             self._stopping_worker = True
             self._worker.stop()
@@ -5417,7 +5590,7 @@ class MainWindow(QMainWindow):
                         self.status_label.setText(f"Ошибка архивации состояния связи: {exc}")
             self._last_connection_state = state
 
-        if self._worker is not None and self._worker.isRunning():
+        if self._is_live_stream_running():
             self.action_start.setEnabled(False)
             self.action_stop.setEnabled(True)
 
