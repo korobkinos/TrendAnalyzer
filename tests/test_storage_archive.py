@@ -86,6 +86,40 @@ class ArchiveStoreSchemaTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_signals_meta_updated_only_when_name_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "archive_meta.db"
+            store = ArchiveStore(str(db_path))
+
+            store.insert_batch("profile-1", 1000.0, [("sig-1", "Signal A", 1.0)])
+            store.flush()
+            first_name, first_updated_at = store._conn.execute(  # noqa: SLF001 - test helper
+                "SELECT signal_name, updated_at FROM signals_meta WHERE profile_id = ? AND signal_id = ?",
+                ("profile-1", "sig-1"),
+            ).fetchone()
+
+            store.insert_batch("profile-1", 1010.0, [("sig-1", "Signal A", 2.0)])
+            store.flush()
+            second_name, second_updated_at = store._conn.execute(  # noqa: SLF001 - test helper
+                "SELECT signal_name, updated_at FROM signals_meta WHERE profile_id = ? AND signal_id = ?",
+                ("profile-1", "sig-1"),
+            ).fetchone()
+
+            self.assertEqual(first_name, "Signal A")
+            self.assertEqual(second_name, "Signal A")
+            self.assertEqual(float(first_updated_at), float(second_updated_at))
+
+            store.insert_batch("profile-1", 1020.0, [("sig-1", "Signal A (renamed)", 3.0)])
+            store.flush()
+            third_name, third_updated_at = store._conn.execute(  # noqa: SLF001 - test helper
+                "SELECT signal_name, updated_at FROM signals_meta WHERE profile_id = ? AND signal_id = ?",
+                ("profile-1", "sig-1"),
+            ).fetchone()
+
+            self.assertEqual(third_name, "Signal A (renamed)")
+            self.assertGreater(float(third_updated_at), float(second_updated_at))
+            store.close()
+
     def test_legacy_samples_table_is_recreated_without_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "archive_legacy.db"

@@ -54,51 +54,37 @@ class ModbusWorker(QThread):
                     continue
                 reconnect_delay_s = 0.5
 
-            samples: dict[str, tuple[str, float]] = {}
-            comm_error: tuple[SignalConfig, Exception] | None = None
-            for signal in self.profile.signals:
-                value: float | None = None
-                read_exc: Exception | None = None
-                for attempt in range(read_attempts):
-                    try:
-                        value = self._read_signal(
-                            client,
-                            signal,
-                            self.profile.unit_id,
-                            self.profile.address_offset,
-                        )
-                        read_exc = None
-                        break
-                    except Exception as exc:
-                        read_exc = exc
-                        if not ModbusWorker._is_connection_error(exc):
-                            break
-                        if attempt + 1 < read_attempts:
-                            time.sleep(min(0.05 * (attempt + 1), 0.25))
-
-                if read_exc is not None:
-                    exc = read_exc
-                    if ModbusWorker._is_connection_error(exc):
-                        comm_error = (signal, exc)
-                        break
-                    address = signal.address + self.profile.address_offset
-                    addr_text = f"{address}.{signal.bit_index}" if signal.data_type == "bool" else str(address)
-                    self.error.emit(
-                        f"{signal.name} addr={addr_text} {signal.data_type}/{signal.float_order}: {exc}"
-                    )
-                    continue
-
-                if not is_connected:
-                    is_connected = True
-                    self.connection_changed.emit(True)
-                samples[signal.id] = (signal.name, float(value))
+            specs = ModbusWorker._build_read_specs(
+                self.profile.signals,
+                address_offset=self.profile.address_offset,
+                default_scale=1.0,
+            )
+            samples, read_errors, comm_error = ModbusWorker._read_specs_grouped(
+                client,
+                specs,
+                self.profile.unit_id,
+                read_attempts=read_attempts,
+            )
+            if not is_connected:
+                is_connected = True
+                self.connection_changed.emit(True)
+            for spec, exc in read_errors:
+                address = int(spec.get("address", 0))
+                data_type = str(spec.get("data_type", "int16"))
+                bit_index = int(spec.get("bit_index", 0))
+                addr_text = f"{address}.{bit_index}" if data_type == "bool" else str(address)
+                self.error.emit(
+                    f"{spec.get('name', '?')} addr={addr_text} {data_type}/{spec.get('float_order', 'ABCD')}: {exc}"
+                )
 
             if comm_error is not None:
-                signal, exc = comm_error
-                address = signal.address + self.profile.address_offset
-                addr_text = f"{address}.{signal.bit_index}" if signal.data_type == "bool" else str(address)
+                spec, exc = comm_error
+                address = int(spec.get("address", 0))
+                data_type = str(spec.get("data_type", "int16"))
+                bit_index = int(spec.get("bit_index", 0))
+                addr_text = f"{address}.{bit_index}" if data_type == "bool" else str(address)
                 self.error.emit(
-                    f"{signal.name} addr={addr_text} {signal.data_type}/{signal.float_order}: {exc}"
+                    f"{spec.get('name', '?')} addr={addr_text} {data_type}/{spec.get('float_order', 'ABCD')}: {exc}"
                 )
                 try:
                     client.close()
@@ -148,6 +134,227 @@ class ModbusWorker(QThread):
         registers = list(response.registers)
         value = ModbusWorker._decode_registers(signal.data_type, registers, signal.float_order, signal.bit_index)
         return value * signal.scale
+
+    @staticmethod
+    def _normalize_register_type(register_type: str) -> str:
+        return "input" if str(register_type or "").lower() == "input" else "holding"
+
+    @staticmethod
+    def _signal_word_count(data_type: str) -> int:
+        return 2 if str(data_type or "").lower() == "float32" else 1
+
+    @staticmethod
+    def _build_read_specs(signals: list[Any], address_offset: int = 0, default_scale: float = 1.0) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        for index, signal in enumerate(signals):
+            try:
+                signal_id = str(getattr(signal, "id", "") or f"sig_{index}")
+                name = str(getattr(signal, "name", "") or signal_id)
+                register_type = ModbusWorker._normalize_register_type(str(getattr(signal, "register_type", "holding")))
+                data_type = str(getattr(signal, "data_type", "int16") or "int16").lower()
+                if data_type not in {"int16", "uint16", "float32", "bool"}:
+                    data_type = "int16"
+                float_order = str(getattr(signal, "float_order", "ABCD") or "ABCD")
+                bit_index = max(0, min(15, int(getattr(signal, "bit_index", 0) or 0)))
+                scale = float(getattr(signal, "scale", default_scale) or default_scale)
+                address = max(0, int(getattr(signal, "address", 0) or 0) + int(address_offset))
+            except Exception:
+                continue
+            word_count = ModbusWorker._signal_word_count(data_type)
+            specs.append(
+                {
+                    "id": signal_id,
+                    "name": name,
+                    "register_type": register_type,
+                    "data_type": data_type,
+                    "float_order": float_order,
+                    "bit_index": bit_index,
+                    "scale": scale,
+                    "address": address,
+                    "word_count": int(word_count),
+                    "end_address": int(address + word_count - 1),
+                }
+            )
+        return specs
+
+    @staticmethod
+    def _build_read_blocks(specs: list[dict[str, Any]], max_words: int = 125) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        for register_type in ("holding", "input"):
+            type_specs = sorted(
+                [spec for spec in specs if str(spec.get("register_type")) == register_type],
+                key=lambda item: (int(item.get("address", 0)), int(item.get("word_count", 1))),
+            )
+            if not type_specs:
+                continue
+            current_specs: list[dict[str, Any]] = []
+            block_start = 0
+            block_end = -1
+            for spec in type_specs:
+                start = int(spec.get("address", 0))
+                end = int(spec.get("end_address", start))
+                if not current_specs:
+                    current_specs = [spec]
+                    block_start = start
+                    block_end = end
+                    continue
+                new_end = max(block_end, end)
+                fits = (new_end - block_start + 1) <= int(max_words)
+                contiguous = start <= (block_end + 1)
+                if contiguous and fits:
+                    current_specs.append(spec)
+                    block_end = new_end
+                else:
+                    blocks.append(
+                        {
+                            "register_type": register_type,
+                            "start": int(block_start),
+                            "count": int(block_end - block_start + 1),
+                            "specs": current_specs,
+                        }
+                    )
+                    current_specs = [spec]
+                    block_start = start
+                    block_end = end
+            if current_specs:
+                blocks.append(
+                    {
+                        "register_type": register_type,
+                        "start": int(block_start),
+                        "count": int(block_end - block_start + 1),
+                        "specs": current_specs,
+                    }
+                )
+        return blocks
+
+    @staticmethod
+    def _read_block_registers(
+        client: ModbusTcpClient,
+        register_type: str,
+        start: int,
+        count: int,
+        unit_id: int,
+    ) -> list[int]:
+        if register_type == "input":
+            response = ModbusWorker._read_input_registers(client, start, count, unit_id)
+        else:
+            response = ModbusWorker._read_holding_registers(client, start, count, unit_id)
+        if response.isError():
+            raise RuntimeError(str(response))
+        return [int(value) for value in list(getattr(response, "registers", []) or [])]
+
+    @staticmethod
+    def _read_specs_grouped(
+        client: ModbusTcpClient,
+        specs: list[dict[str, Any]],
+        unit_id: int,
+        read_attempts: int = 1,
+    ) -> tuple[
+        dict[str, tuple[str, float]],
+        list[tuple[dict[str, Any], Exception]],
+        tuple[dict[str, Any], Exception] | None,
+    ]:
+        values: dict[str, tuple[str, float]] = {}
+        errors: list[tuple[dict[str, Any], Exception]] = []
+        if not specs:
+            return values, errors, None
+
+        for block in ModbusWorker._build_read_blocks(specs):
+            block_values, block_errors, comm_error = ModbusWorker._read_block_with_fallback(
+                client,
+                block,
+                unit_id,
+                max(1, int(read_attempts)),
+            )
+            values.update(block_values)
+            errors.extend(block_errors)
+            if comm_error is not None:
+                return values, errors, comm_error
+        return values, errors, None
+
+    @staticmethod
+    def _read_block_with_fallback(
+        client: ModbusTcpClient,
+        block: dict[str, Any],
+        unit_id: int,
+        read_attempts: int,
+    ) -> tuple[
+        dict[str, tuple[str, float]],
+        list[tuple[dict[str, Any], Exception]],
+        tuple[dict[str, Any], Exception] | None,
+    ]:
+        specs = list(block.get("specs") or [])
+        if not specs:
+            return {}, [], None
+
+        start = int(block.get("start", 0))
+        count = max(1, int(block.get("count", 1)))
+        register_type = ModbusWorker._normalize_register_type(str(block.get("register_type", "holding")))
+
+        registers: list[int] = []
+        last_exc: Exception | None = None
+        for attempt in range(max(1, int(read_attempts))):
+            try:
+                registers = ModbusWorker._read_block_registers(client, register_type, start, count, unit_id)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if not ModbusWorker._is_connection_error(exc):
+                    break
+                if attempt + 1 < read_attempts:
+                    time.sleep(min(0.05 * (attempt + 1), 0.25))
+
+        if last_exc is not None:
+            if ModbusWorker._is_connection_error(last_exc):
+                return {}, [], (specs[0], last_exc)
+            if len(specs) > 1:
+                merged_values: dict[str, tuple[str, float]] = {}
+                merged_errors: list[tuple[dict[str, Any], Exception]] = []
+                for spec in specs:
+                    single_block = {
+                        "register_type": str(spec.get("register_type", register_type)),
+                        "start": int(spec.get("address", 0)),
+                        "count": int(spec.get("word_count", 1)),
+                        "specs": [spec],
+                    }
+                    values, errors, comm_error = ModbusWorker._read_block_with_fallback(
+                        client,
+                        single_block,
+                        unit_id,
+                        read_attempts,
+                    )
+                    merged_values.update(values)
+                    merged_errors.extend(errors)
+                    if comm_error is not None:
+                        return merged_values, merged_errors, comm_error
+                return merged_values, merged_errors, None
+            return {}, [(specs[0], last_exc)], None
+
+        values: dict[str, tuple[str, float]] = {}
+        errors: list[tuple[dict[str, Any], Exception]] = []
+        for spec in specs:
+            try:
+                spec_address = int(spec.get("address", 0))
+                word_count = max(1, int(spec.get("word_count", 1)))
+                left = spec_address - start
+                right = left + word_count
+                if left < 0 or right > len(registers):
+                    raise RuntimeError(
+                        f"Недостаточно регистров в ответе блока ({len(registers)}), требуется {word_count}"
+                    )
+                chunk = registers[left:right]
+                decoded = ModbusWorker._decode_registers(
+                    str(spec.get("data_type", "int16")),
+                    chunk,
+                    str(spec.get("float_order", "ABCD")),
+                    int(spec.get("bit_index", 0)),
+                )
+                value = float(decoded) * float(spec.get("scale", 1.0))
+                values[str(spec.get("id", ""))] = (str(spec.get("name", "")), value)
+            except Exception as exc:
+                errors.append((spec, exc))
+        return values, errors, None
 
     @staticmethod
     def _decode_registers(data_type: str, registers: list[int], float_order: str, bit_index: int) -> float:

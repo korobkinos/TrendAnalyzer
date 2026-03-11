@@ -396,6 +396,10 @@ class RecorderApiServer:
                     ok, result = outer._service.api_modbus_read(payload)
                     self._send_json(HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, {"ok": ok, **result})
                     return
+                if parsed.path == "/v1/modbus/read_many":
+                    ok, result = outer._service.api_modbus_read_many(payload)
+                    self._send_json(HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, {"ok": ok, **result})
+                    return
                 if parsed.path == "/v1/modbus/write":
                     ok, result = outer._service.api_modbus_write(payload)
                     self._send_json(HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, {"ok": ok, **result})
@@ -442,6 +446,106 @@ def api_modbus_read(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[bo
         signal.scale = 1.0
         value = ModbusWorker._read_signal(client, signal, unit_id, address_offset)
         return True, {"address": int(address), "value": float(value)}
+    except Exception as exc:
+        return False, {"error": str(exc)}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def api_modbus_read_many(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return False, {"error": "items_missing"}
+    if not raw_items:
+        return True, {"values": [], "errors": []}
+
+    address_offset = int(payload.get("address_offset", profile.address_offset) or 0)
+    unit_id = int(payload.get("unit_id", profile.unit_id) or profile.unit_id)
+    timeout_s = _safe_float(
+        str(payload.get("timeout_s") if payload.get("timeout_s") is not None else profile.timeout_s),
+        profile.timeout_s,
+    )
+    host = str(payload.get("host") or profile.ip)
+    port = _safe_int(
+        str(payload.get("port") if payload.get("port") is not None else profile.port),
+        profile.port,
+        minimum=1,
+        maximum=65535,
+    )
+    read_attempts = _safe_int(
+        str(payload.get("read_attempts") if payload.get("read_attempts") is not None else (int(profile.retries) + 1)),
+        int(profile.retries) + 1,
+        minimum=1,
+        maximum=10,
+    )
+
+    temp_items: list[Any] = []
+    order: list[str] = []
+    for index, item in enumerate(raw_items[:5000]):
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or f"item_{index}")
+        register_type = str(item.get("register_type") or "holding")
+        data_type = str(item.get("data_type") or "int16")
+        float_order = str(item.get("float_order") or "ABCD")
+        address = _safe_int(str(item.get("address", "0")), 0, minimum=0)
+        bit_index = _safe_int(str(item.get("bit_index", "0")), 0, minimum=0, maximum=15)
+
+        signal = type("ApiBatchSignal", (), {})()
+        signal.id = item_id
+        signal.name = str(item.get("name") or item_id)
+        signal.address = int(address)
+        signal.register_type = register_type
+        signal.data_type = data_type
+        signal.bit_index = int(bit_index)
+        signal.float_order = float_order
+        signal.scale = 1.0
+        temp_items.append(signal)
+        order.append(item_id)
+
+    if not temp_items:
+        return False, {"error": "items_invalid"}
+
+    client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
+    try:
+        if not client.connect():
+            return False, {"error": f"connect_failed {host}:{port}"}
+
+        specs = ModbusWorker._build_read_specs(temp_items, address_offset=address_offset, default_scale=1.0)
+        values, errors, comm_error = ModbusWorker._read_specs_grouped(
+            client,
+            specs,
+            unit_id=unit_id,
+            read_attempts=read_attempts,
+        )
+        values_payload = []
+        for item_id in order:
+            entry = values.get(str(item_id))
+            if entry is None:
+                continue
+            _name, value = entry
+            values_payload.append({"id": str(item_id), "value": float(value)})
+
+        errors_payload = [
+            {"id": str(spec.get("id", "")), "error": str(exc)}
+            for spec, exc in errors
+        ]
+        comm_payload = None
+        if comm_error is not None:
+            comm_spec, comm_exc = comm_error
+            comm_payload = {
+                "id": str(comm_spec.get("id", "")),
+                "error": str(comm_exc),
+            }
+
+        return True, {
+            "values": values_payload,
+            "errors": errors_payload,
+            "connection_error": comm_payload,
+        }
     except Exception as exc:
         return False, {"error": str(exc)}
     finally:

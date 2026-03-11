@@ -136,6 +136,7 @@ class ArchiveStore:
             ON CONFLICT(profile_id, signal_id) DO UPDATE SET
                 signal_name = excluded.signal_name,
                 updated_at = excluded.updated_at
+            WHERE signals_meta.signal_name != excluded.signal_name
             """,
             list(name_rows_map.values()),
         )

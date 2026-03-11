@@ -93,6 +93,15 @@ class MultiAxisChart(QWidget):
         self.stats_line_end.hide()
         self.plot_item.addItem(self.stats_line_start)
         self.plot_item.addItem(self.stats_line_end)
+        self.stats_region = pg.LinearRegionItem(
+            values=[0.0, 1.0],
+            movable=False,
+            brush=pg.mkBrush(46, 204, 113, 55),
+            pen=pg.mkPen(46, 204, 113, 110),
+        )
+        self.stats_region.setZValue(-15)
+        self.stats_region.hide()
+        self.plot_item.addItem(self.stats_region)
 
         self.plot_widget.scene().sigMouseClicked.connect(self._on_mouse_clicked)
         self.plot_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -648,6 +657,7 @@ class MultiAxisChart(QWidget):
         if not self._stats_range_enabled:
             self.stats_line_start.hide()
             self.stats_line_end.hide()
+            self.stats_region.hide()
             return
         self.place_stats_range_in_view()
 
@@ -675,6 +685,10 @@ class MultiAxisChart(QWidget):
         if self._stats_range_enabled:
             self.stats_line_start.show()
             self.stats_line_end.show()
+            self.stats_region.setRegion([start, end])
+            self.stats_region.show()
+        else:
+            self.stats_region.hide()
         self._emit_stats_range_changed()
 
     def get_stats_range(self) -> tuple[float, float] | None:
@@ -697,6 +711,12 @@ class MultiAxisChart(QWidget):
     def _on_stats_line_position_changed(self) -> None:
         if self._setting_stats_range:
             return
+        points = self.get_stats_range()
+        if points is not None:
+            self.stats_region.setRegion([points[0], points[1]])
+            self.stats_region.show()
+        else:
+            self.stats_region.hide()
         self._emit_stats_range_changed()
 
     def compute_statistics(self, start_ts: float, end_ts: float) -> list[dict]:

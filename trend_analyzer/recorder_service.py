@@ -17,7 +17,7 @@ from .logging_utils import setup_logging
 from .instance_lock import SingleInstanceLock
 from .models import ProfileConfig
 from .modbus_worker import ModbusWorker
-from .recorder_api import RecorderApiServer, api_modbus_read, api_modbus_write
+from .recorder_api import RecorderApiServer, api_modbus_read, api_modbus_read_many, api_modbus_write
 from .recorder_shared import (
     RECORDER_CONFIG_FORMAT,
     RECORDER_STATUS_FORMAT,
@@ -210,6 +210,9 @@ class RecorderService:
     def api_modbus_read(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         return api_modbus_read(self.get_runtime_profile(), payload)
 
+    def api_modbus_read_many(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        return api_modbus_read_many(self.get_runtime_profile(), payload)
+
     def api_modbus_write(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         return api_modbus_write(self.get_runtime_profile(), payload)
 
@@ -319,8 +322,27 @@ class RecorderService:
                 started = time.monotonic()
                 self._cycles_total += 1
                 read_attempts = max(1, int(profile.retries) + 1)
-                signal_types_by_id = {str(sig.id): str(sig.data_type or "int16") for sig in profile.signals if str(sig.id)}
+                local_signals = self._local_signals(profile)
+                signal_types_by_id = {str(sig.id): str(sig.data_type or "int16") for sig in local_signals if str(sig.id)}
                 self._refresh_runtime_metrics(profile, store)
+
+                # Local recorder must poll/archive only local signals.
+                # Remote source signals are collected by their own recorder APIs.
+                if not local_signals:
+                    if is_connected:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                        is_connected = False
+                        self._runtime_connected = False
+                        self._write_connection_state_event(store, profile, False, last_connection_state)
+                        last_connection_state = False
+                    self._runtime_connected = False
+                    self._publish_status_if_due(profile, False, "локальные сигналы не настроены", last_status_publish)
+                    last_status_publish = time.monotonic()
+                    self._sleep_interruptible(max(0.2, float(profile.poll_interval_ms) / 1000.0))
+                    continue
 
                 if not client.connected:
                     try:
@@ -342,41 +364,35 @@ class RecorderService:
                         continue
                     reconnect_delay_s = 0.5
 
-                samples: dict[str, tuple[str, float]] = {}
-                comm_error: tuple[str, Exception] | None = None
-                for signal_cfg in profile.signals:
-                    value: float | None = None
-                    read_exc: Exception | None = None
-                    for attempt in range(read_attempts):
-                        try:
-                            value = ModbusWorker._read_signal(
-                                client,
-                                signal_cfg,
-                                profile.unit_id,
-                                profile.address_offset,
-                            )
-                            read_exc = None
-                            break
-                        except Exception as exc:
-                            read_exc = exc
-                            if not ModbusWorker._is_connection_error(exc):
-                                break
-                            if attempt + 1 < read_attempts:
-                                time.sleep(min(0.05 * (attempt + 1), 0.25))
-
-                    if read_exc is not None:
-                        if ModbusWorker._is_connection_error(read_exc):
-                            comm_error = (signal_cfg.name, read_exc)
-                            break
-                        self._register_error(
-                            f"{signal_cfg.name} addr={signal_cfg.address} {signal_cfg.data_type}/{signal_cfg.float_order}: {read_exc}"
-                        )
-                        continue
-
-                    samples[str(signal_cfg.id)] = (str(signal_cfg.name), float(value))
+                specs = ModbusWorker._build_read_specs(
+                    local_signals,
+                    address_offset=profile.address_offset,
+                    default_scale=1.0,
+                )
+                samples, read_errors, comm_error = ModbusWorker._read_specs_grouped(
+                    client,
+                    specs,
+                    profile.unit_id,
+                    read_attempts=read_attempts,
+                )
+                for spec, read_exc in read_errors:
+                    address = int(spec.get("address", 0))
+                    data_type = str(spec.get("data_type", "int16"))
+                    bit_index = int(spec.get("bit_index", 0))
+                    addr_text = f"{address}.{bit_index}" if data_type == "bool" else str(address)
+                    self._register_error(
+                        f"{spec.get('name', '?')} addr={addr_text} {data_type}/{spec.get('float_order', 'ABCD')}: {read_exc}"
+                    )
 
                 if comm_error is not None:
-                    self._register_error(f"{comm_error[0]}: {comm_error[1]}")
+                    spec, exc = comm_error
+                    address = int(spec.get("address", 0))
+                    data_type = str(spec.get("data_type", "int16"))
+                    bit_index = int(spec.get("bit_index", 0))
+                    addr_text = f"{address}.{bit_index}" if data_type == "bool" else str(address)
+                    self._register_error(
+                        f"{spec.get('name', '?')} addr={addr_text} {data_type}/{spec.get('float_order', 'ABCD')}: {exc}"
+                    )
                     try:
                         client.close()
                     except Exception:
@@ -603,6 +619,14 @@ class RecorderService:
             archive_last_values[sid] = val
             archive_last_written_ts[sid] = float(ts)
         return rows
+
+    @staticmethod
+    def _local_signals(profile: ProfileConfig) -> list[Any]:
+        return [
+            signal
+            for signal in list(getattr(profile, "signals", []) or [])
+            if str(getattr(signal, "source_id", "local") or "local") == "local"
+        ]
 
 
 def run_recorder_service() -> None:
