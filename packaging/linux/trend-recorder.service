@@ -1,0 +1,18 @@
+[Unit]
+Description=Trend Recorder (headless Modbus archive service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trendrec
+Group=trendrec
+WorkingDirectory=/var/lib/trend-recorder
+Environment=HOME=/var/lib/trend-recorder
+ExecStart=/usr/bin/trend-recorder
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+
