@@ -1,20 +1,26 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
+import concurrent.futures
 import csv
 from datetime import datetime
 import bisect
 import ctypes
+import ipaddress
 import math
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 import uuid
 import zipfile
 
@@ -61,7 +67,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     psutil = None
 
-from .models import ProfileConfig, SignalConfig, TagConfig, TagTabConfig
+from .models import ProfileConfig, RecorderSourceConfig, SignalConfig, TagConfig, TagTabConfig
 from .modbus_worker import ModbusWorker
 from .storage import ArchiveStore, ConfigStore, DEFAULT_DB_PATH, atomic_write_text
 from .archive_bundle import (
@@ -74,14 +80,14 @@ from .archive_bundle import (
 )
 from .startup import set_windows_autostart
 from .logging_utils import setup_logging
+from .instance_lock import SingleInstanceLock, show_already_running_message
 from .recorder_shared import (
     RECORDER_CONFIG_FORMAT,
     RECORDER_CONFIG_PATH,
     RECORDER_PID_PATH,
     RECORDER_STATUS_PATH,
     clear_recorder_pid,
-    is_pid_running,
-    read_recorder_pid,
+    resolve_recorder_pid,
     read_recorder_status,
     request_recorder_stop,
     write_recorder_config,
@@ -99,11 +105,24 @@ DEFAULT_COLORS = [
     "#8c564b",
 ]
 
+ROLE_SIGNAL_ID = int(Qt.ItemDataRole.UserRole)
+ROLE_SIGNAL_SOURCE_ID = ROLE_SIGNAL_ID + 1
+ROLE_SIGNAL_REMOTE_TAG_ID = ROLE_SIGNAL_ID + 2
+
 from .chart import MultiAxisChart, format_ts_ms
 
 
+def _detached_process_env() -> dict[str, str]:
+    env = os.environ.copy()
+    # For PyInstaller one-file builds: force child process to use its own
+    # extraction dir so parent can clean up _MEI on exit.
+    if getattr(sys, "frozen", False):
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 class AutoClearStatusLabel(QLabel):
-    def __init__(self, idle_text: str = "Статус: ожидание", clear_after_ms: int = 5000, parent: QWidget | None = None):
+    def __init__(self, idle_text: str = 'Статус: ожидание', clear_after_ms: int = 5000, parent: QWidget | None = None):
         super().__init__(idle_text, parent)
         self._idle_text = str(idle_text)
         self._clear_timer = QTimer(self)
@@ -114,7 +133,7 @@ class AutoClearStatusLabel(QLabel):
     def setText(self, text: str) -> None:  # type: ignore[override]
         value = str(text)
         super().setText(value)
-        if value.startswith("Статус:") and value != self._idle_text:
+        if value.startswith('Статус:') and value != self._idle_text:
             self._clear_timer.start()
         else:
             self._clear_timer.stop()
@@ -149,8 +168,21 @@ class MainWindow(QMainWindow):
         self._archive_store: ArchiveStore | None = None
         self._db_live_conn: sqlite3.Connection | None = None
         self._db_live_running = False
+        self._local_live_enabled = True
         self._db_live_last_sample_row_id = 0
         self._db_live_last_connection_event_row_id = 0
+        self._remote_live_cursors: dict[str, dict[str, int]] = {}
+        self._remote_live_executor: concurrent.futures.ThreadPoolExecutor | None = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8,
+            thread_name_prefix="trend-remote-live",
+        )
+        self._remote_live_futures: dict[str, concurrent.futures.Future] = {}
+        self._remote_live_backoff_until_mono: dict[str, float] = {}
+        self._remote_live_fail_count: dict[str, int] = {}
+        self._remote_last_ok_mono: dict[str, float] = {}
+        self._last_live_values: dict[str, tuple[str, float]] = {}
+        self._live_cycle_has_new_samples = False
+        self._last_ui_heartbeat_ts = 0.0
         self._last_archive_ts = 0.0
         self._last_retention_cleanup_ts = 0.0
         self._archive_last_values: dict[str, float] = {}
@@ -198,6 +230,8 @@ class MainWindow(QMainWindow):
         self._runtime_stats_timer.setSingleShot(False)
         self._runtime_stats_timer.setInterval(1000)
         self._runtime_stats_timer.timeout.connect(self._update_runtime_status_panel)
+        self._runtime_stats_timer.timeout.connect(self._update_recorder_dependent_ui_state)
+        self._recorder_controls_enabled: bool | None = None
 
         self.config_store = ConfigStore()
         self.app_config = self.config_store.load()
@@ -216,13 +250,17 @@ class MainWindow(QMainWindow):
 
         # Internal mode controls (state carrier); user interacts via menu.
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Онлайн", "online")
-        self.mode_combo.addItem("Офлайн", "offline")
-        self.archive_to_db_checkbox = QCheckBox("Писать в БД")
+        self.mode_combo.addItem('Онлайн', "online")
+        self.mode_combo.addItem('Офлайн', "offline")
+        self.archive_to_db_checkbox = QCheckBox('Писать в БД')
         self.archive_to_db_checkbox.setChecked(True)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_combo_changed)
 
-        self.status_label = AutoClearStatusLabel("Статус: ожидание", 5000, self)
+        self.status_label = AutoClearStatusLabel(
+            'Статус: шаги — 1) Подключение  2) Сигналы  3) Старт',
+            5000,
+            self,
+        )
 
         self.chart = MultiAxisChart()
         self._values_collapsed = False
@@ -259,53 +297,53 @@ class MainWindow(QMainWindow):
         values_header_layout = QHBoxLayout(values_header)
         values_header_layout.setContentsMargins(6, 0, 6, 0)
         values_header_layout.setSpacing(3)
-        values_header_layout.addWidget(QLabel("Сортировка:"))
+        values_header_layout.addWidget(QLabel('Сортировка:'))
         self.values_sort_combo = QComboBox()
-        self.values_sort_combo.addItem("Имя (А-Я)", "name_asc")
-        self.values_sort_combo.addItem("Имя (Я-А)", "name_desc")
-        self.values_sort_combo.addItem("Вид: активные", "visible_first")
-        self.values_sort_combo.addItem("Вид: скрытые", "hidden_first")
+        self.values_sort_combo.addItem('Имя (А-Я)', "name_asc")
+        self.values_sort_combo.addItem('Имя (Я-А)', "name_desc")
+        self.values_sort_combo.addItem('Вид: активные', "visible_first")
+        self.values_sort_combo.addItem('Вид: скрытые', "hidden_first")
         self.values_sort_combo.setCurrentIndex(0)
         self.values_sort_combo.currentIndexChanged.connect(self._on_values_sort_changed)
         values_header_layout.addWidget(self.values_sort_combo)
-        self.values_auto_x_checkbox = QCheckBox("Авто X")
+        self.values_auto_x_checkbox = QCheckBox('Авто X')
         self.values_auto_x_checkbox.setChecked(True)
         self.values_auto_x_checkbox.toggled.connect(self._on_values_auto_x_toggled)
         values_header_layout.addWidget(self.values_auto_x_checkbox)
-        self.values_cursor_checkbox = QCheckBox("Курсор")
+        self.values_cursor_checkbox = QCheckBox('Курсор')
         self.values_cursor_checkbox.setChecked(False)
         self.values_cursor_checkbox.toggled.connect(self._on_values_cursor_toggled)
         values_header_layout.addWidget(self.values_cursor_checkbox)
-        self.values_reset_zoom_btn = QPushButton("Сброс масштаба")
+        self.values_reset_zoom_btn = QPushButton('Сброс масштаба')
         self.values_reset_zoom_btn.clicked.connect(lambda _checked=False: self.chart.reset_view())
         values_header_layout.addWidget(self.values_reset_zoom_btn)
-        self.values_statistics_btn = QPushButton("Статистика")
+        self.values_statistics_btn = QPushButton('Статистика')
         self.values_statistics_btn.clicked.connect(self._show_statistics_window)
         values_header_layout.addWidget(self.values_statistics_btn)
         values_header_layout.addStretch(1)
 
         self.values_collapse_btn = QToolButton()
-        self.values_collapse_btn.setText("—")
-        self.values_collapse_btn.setToolTip("Свернуть/развернуть")
+        self.values_collapse_btn.setText('—')
+        self.values_collapse_btn.setToolTip('Свернуть/развернуть')
         self.values_collapse_btn.clicked.connect(self._toggle_values_panel)
         values_header_layout.addWidget(self.values_collapse_btn)
 
         values_expand_btn = QToolButton()
-        values_expand_btn.setText("□")
-        values_expand_btn.setToolTip("Развернуть панель")
+        values_expand_btn.setText('□')
+        values_expand_btn.setToolTip('Развернуть панель')
         values_expand_btn.clicked.connect(self._expand_values_panel)
         values_header_layout.addWidget(values_expand_btn)
 
         values_close_btn = QToolButton()
-        values_close_btn.setText("×")
-        values_close_btn.setToolTip("Скрыть таблицу")
+        values_close_btn.setText("Г—")
+        values_close_btn.setToolTip('Скрыть таблицу')
         values_close_btn.clicked.connect(self._close_values_panel)
         values_header_layout.addWidget(values_close_btn)
 
         values_layout.addWidget(values_header)
 
         self.values_table = QTableWidget(0, 7)
-        self.values_table.setHorizontalHeaderLabels(["Вид", "Сигнал", "Шкала", "Значение", "Время", "Источник", "Цвет"])
+        self.values_table.setHorizontalHeaderLabels(['Вид', 'Сигнал', 'Шкала', 'Значение', 'Время', 'Источник', 'Цвет'])
         header = self.values_table.horizontalHeader()
         header.setStretchLastSection(False)
         for col in range(self.values_table.columnCount()):
@@ -335,6 +373,7 @@ class MainWindow(QMainWindow):
 
         self._build_connection_window()
         self._build_signals_window()
+        self._build_sources_window()
         self._build_tags_window()
         self._build_scales_window()
         self._build_graph_settings_window()
@@ -354,7 +393,7 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self._status_left_spacer, 0)
         status_bar.addWidget(self.status_label, 1)
         self.status_label.setContentsMargins(0, 0, 0, 0)
-        self.runtime_indicator_label = QLabel("●")
+        self.runtime_indicator_label = QLabel('●')
         self.runtime_indicator_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.runtime_indicator_label.setStyleSheet("font-size: 12px; color: #ef5350;")
         self.runtime_indicator_label.setFixedWidth(14)
@@ -371,11 +410,12 @@ class MainWindow(QMainWindow):
         status_bar.addPermanentWidget(self._status_right_spacer, 0)
         self._update_runtime_status_panel()
         self._runtime_stats_timer.start()
+        self._update_recorder_dependent_ui_state()
 
     @staticmethod
     def _format_bytes_human(size_bytes: int | float) -> str:
         value = max(0.0, float(size_bytes))
-        units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
+        units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ']
         idx = 0
         while value >= 1024.0 and idx < len(units) - 1:
             value /= 1024.0
@@ -454,9 +494,9 @@ class MainWindow(QMainWindow):
 
     def _update_runtime_status_panel(self) -> None:
         try:
-            connected = bool(self._runtime_connected and self._worker is not None and self._worker.isRunning())
+            connected = bool(self._runtime_connected and self._is_live_stream_running())
             indicator_color = "#70d26f" if connected else "#ef5350"
-            indicator_text = "подключено" if connected else "не подключено"
+            indicator_text = 'подключено' if connected else 'не подключено'
             cpu_percent = self._estimate_cpu_percent()
             mem_bytes = self._get_memory_usage_bytes()
             if mem_bytes is not None:
@@ -469,13 +509,13 @@ class MainWindow(QMainWindow):
             mode = str(getattr(self.current_profile, "work_mode", "online") or "online")
             write_enabled = bool(getattr(self.current_profile, "archive_to_db", False)) and mode == "online"
             if not write_enabled:
-                archive_mode_text = "архив выкл"
+                archive_mode_text = 'архив выкл'
             elif bool(getattr(self.current_profile, "archive_on_change_only", False)):
-                archive_mode_text = "архив: изменения"
+                archive_mode_text = 'архив: изменения'
             else:
-                archive_mode_text = "архив: все точки"
+                archive_mode_text = 'архив: все точки'
             render_mode_text = (
-                "график: вкл" if bool(getattr(self.current_profile, "render_chart_enabled", True)) else "график: выкл"
+                'график: вкл' if bool(getattr(self.current_profile, "render_chart_enabled", True)) else 'график: выкл'
             )
             if hasattr(self, "runtime_indicator_label"):
                 self.runtime_indicator_label.setStyleSheet(f"font-size: 12px; color: {indicator_color};")
@@ -487,7 +527,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "runtime_indicator_label"):
                 self.runtime_indicator_label.setStyleSheet("font-size: 12px; color: #ef5350;")
             if hasattr(self, "runtime_status_label"):
-                self.runtime_status_label.setText("не подключено, CPU -, RAM -, Архив -, график -")
+                self.runtime_status_label.setText('не подключено, CPU -, RAM -, Архив -, график -')
 
     def _on_archive_filter_settings_changed(self, *_args) -> None:
         if self._updating_ui:
@@ -505,7 +545,7 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self.connection_window = QDialog(self, flags)
-        self.connection_window.setWindowTitle("Настройки подключения")
+        self.connection_window.setWindowTitle('Настройки подключения')
         self.connection_window.resize(520, 520)
         self.connection_window.setSizeGripEnabled(True)
         layout = QVBoxLayout(self.connection_window)
@@ -513,15 +553,15 @@ class MainWindow(QMainWindow):
         top_row = QHBoxLayout()
         self.profile_combo = QComboBox()
         self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
-        top_row.addWidget(QLabel("Профиль"))
+        top_row.addWidget(QLabel('Профиль'))
         top_row.addWidget(self.profile_combo, 1)
         layout.addLayout(top_row)
 
         button_row = QHBoxLayout()
-        self.new_profile_btn = QPushButton("Новый")
-        self.clone_profile_btn = QPushButton("Клон")
-        self.delete_profile_btn = QPushButton("Удалить")
-        self.save_profiles_btn = QPushButton("Сохранить")
+        self.new_profile_btn = QPushButton('Новый')
+        self.clone_profile_btn = QPushButton('Клон')
+        self.delete_profile_btn = QPushButton('Удалить')
+        self.save_profiles_btn = QPushButton('Сохранить')
         button_row.addWidget(self.new_profile_btn)
         button_row.addWidget(self.clone_profile_btn)
         button_row.addWidget(self.delete_profile_btn)
@@ -549,13 +589,13 @@ class MainWindow(QMainWindow):
         self.render_interval_spin.setSingleStep(50)
         self.render_interval_spin.setSuffix(" ms")
         self.render_interval_spin.valueChanged.connect(self._on_render_interval_changed)
-        self.render_chart_checkbox = QCheckBox("Включена")
+        self.render_chart_checkbox = QCheckBox('Включена')
         self.render_chart_checkbox.setChecked(True)
         self.render_chart_checkbox.toggled.connect(self._on_render_chart_toggled)
         self.archive_interval_spin = QSpinBox()
         self.archive_interval_spin.setRange(50, 600000)
         self.archive_interval_spin.setSuffix(" ms")
-        self.archive_on_change_checkbox = QCheckBox("Только при изменении")
+        self.archive_on_change_checkbox = QCheckBox('Только при изменении')
         self.archive_on_change_checkbox.toggled.connect(self._on_archive_filter_settings_changed)
         self.archive_deadband_spin = QDoubleSpinBox()
         self.archive_deadband_spin.setRange(0.0, 1_000_000_000.0)
@@ -565,12 +605,12 @@ class MainWindow(QMainWindow):
         self.archive_keepalive_spin = QSpinBox()
         self.archive_keepalive_spin.setRange(0, 86400)
         self.archive_keepalive_spin.setSuffix(" c")
-        self.archive_keepalive_spin.setSpecialValueText("Отключен")
+        self.archive_keepalive_spin.setSpecialValueText('Отключен')
         self.archive_keepalive_spin.valueChanged.connect(self._on_archive_filter_settings_changed)
         self.archive_retention_days_spin = QSpinBox()
         self.archive_retention_days_spin.setRange(0, 3650)
-        self.archive_retention_days_spin.setSuffix(" дн")
-        self.archive_retention_days_spin.setSpecialValueText("Без ограничения")
+        self.archive_retention_days_spin.setSuffix(' дн')
+        self.archive_retention_days_spin.setSpecialValueText('Без ограничения')
         self.timeout_spin = QDoubleSpinBox()
         self.timeout_spin.setRange(0.1, 30.0)
         self.timeout_spin.setSingleStep(0.1)
@@ -579,27 +619,40 @@ class MainWindow(QMainWindow):
         self.retries_spin.setRange(0, 10)
         self.address_offset_spin = QSpinBox()
         self.address_offset_spin.setRange(-10, 10)
+        self.recorder_api_enabled_checkbox = QCheckBox('Включено')
+        self.recorder_api_enabled_checkbox.setChecked(True)
+        self.recorder_api_host_edit = QLineEdit()
+        self.recorder_api_host_edit.setText("0.0.0.0")
+        self.recorder_api_port_spin = QSpinBox()
+        self.recorder_api_port_spin.setRange(1, 65535)
+        self.recorder_api_port_spin.setValue(18777)
+        self.recorder_api_token_edit = QLineEdit()
+        self.recorder_api_token_edit.setPlaceholderText('необязательно')
 
-        form.addRow("Имя профиля", self.profile_name_edit)
+        form.addRow('Имя профиля', self.profile_name_edit)
         form.addRow("IP", self.ip_edit)
-        form.addRow("Порт", self.port_spin)
-        form.addRow("ID устройства (Unit ID)", self.unit_id_spin)
-        form.addRow("Частота опроса", self.poll_interval_spin)
-        form.addRow("Интервал отрисовки", self.render_interval_spin)
-        form.addRow("Отрисовка графика", self.render_chart_checkbox)
-        form.addRow("Частота архивации", self.archive_interval_spin)
-        form.addRow("Архив: только изменения", self.archive_on_change_checkbox)
-        form.addRow("Архив: deadband", self.archive_deadband_spin)
-        form.addRow("Архив: keepalive", self.archive_keepalive_spin)
-        form.addRow("Глубина архива", self.archive_retention_days_spin)
-        form.addRow("Таймаут", self.timeout_spin)
-        form.addRow("Повторы", self.retries_spin)
-        form.addRow("Смещение адреса", self.address_offset_spin)
+        form.addRow('Порт', self.port_spin)
+        form.addRow('ID устройства (Unit ID)', self.unit_id_spin)
+        form.addRow('Частота опроса', self.poll_interval_spin)
+        form.addRow('Интервал отрисовки', self.render_interval_spin)
+        form.addRow('Отрисовка графика', self.render_chart_checkbox)
+        form.addRow('Частота архивации', self.archive_interval_spin)
+        form.addRow('Архив: только изменения', self.archive_on_change_checkbox)
+        form.addRow('Архив: deadband', self.archive_deadband_spin)
+        form.addRow('Архив: keepalive', self.archive_keepalive_spin)
+        form.addRow('Глубина архива', self.archive_retention_days_spin)
+        form.addRow('Таймаут', self.timeout_spin)
+        form.addRow('Повторы', self.retries_spin)
+        form.addRow('Смещение адреса', self.address_offset_spin)
+        form.addRow('API регистратора', self.recorder_api_enabled_checkbox)
+        form.addRow("API host", self.recorder_api_host_edit)
+        form.addRow("API port", self.recorder_api_port_spin)
+        form.addRow("API token", self.recorder_api_token_edit)
         layout.addLayout(form)
 
-        self.apply_btn = QPushButton("Применить")
+        self.apply_btn = QPushButton('Применить')
         self.apply_btn.clicked.connect(self._apply_current_profile)
-        self.clear_archive_db_btn = QPushButton("Очистить архив БД")
+        self.clear_archive_db_btn = QPushButton('Очистить архив БД')
         self.clear_archive_db_btn.clicked.connect(self._on_clear_archive_db_clicked)
         action_row = QHBoxLayout()
         action_row.addWidget(self.apply_btn)
@@ -613,7 +666,7 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self.signals_window = QDialog(self, flags)
-        self.signals_window.setWindowTitle("Сигналы графика")
+        self.signals_window.setWindowTitle('Сигналы графика')
         self.signals_window.resize(800, 520)
         self.signals_window.setSizeGripEnabled(True)
         layout = QVBoxLayout(self.signals_window)
@@ -628,13 +681,13 @@ class MainWindow(QMainWindow):
         self.signals_step_spin.setRange(1, 1000)
         self.signals_step_spin.setValue(1)
         self.signals_reg_combo = QComboBox()
-        self.signals_reg_combo.addItem("Holding (хран.)", "holding")
-        self.signals_reg_combo.addItem("Input (вход.)", "input")
+        self.signals_reg_combo.addItem('Holding (хран.)', "holding")
+        self.signals_reg_combo.addItem('Input (вход.)', "input")
         self.signals_type_combo = QComboBox()
-        self.signals_type_combo.addItem("INT16 (знак.)", "int16")
-        self.signals_type_combo.addItem("UINT16 (без знака)", "uint16")
+        self.signals_type_combo.addItem('INT16 (знак.)', "int16")
+        self.signals_type_combo.addItem('UINT16 (без знака)', "uint16")
         self.signals_type_combo.addItem("REAL / FLOAT32", "float32")
-        self.signals_type_combo.addItem("BOOL (бит)", "bool")
+        self.signals_type_combo.addItem('BOOL (бит)', "bool")
         self.signals_float_order_combo = QComboBox()
         self.signals_float_order_combo.addItem("ABCD", "ABCD")
         self.signals_float_order_combo.addItem("BADC", "BADC")
@@ -644,19 +697,19 @@ class MainWindow(QMainWindow):
         self.signals_axis_spin = QSpinBox()
         self.signals_axis_spin.setRange(1, 64)
         self.signals_axis_spin.setValue(1)
-        self.signals_add_range_btn = QPushButton("Добавить диапазон")
+        self.signals_add_range_btn = QPushButton('Добавить диапазон')
         self.signals_add_range_btn.clicked.connect(self._on_add_signal_range_clicked)
 
-        bulk_row.addWidget(QLabel("Старт"))
+        bulk_row.addWidget(QLabel('Старт'))
         bulk_row.addWidget(self.signals_start_addr_spin)
-        bulk_row.addWidget(QLabel("Кол-во"))
+        bulk_row.addWidget(QLabel('Кол-во'))
         bulk_row.addWidget(self.signals_count_spin)
-        bulk_row.addWidget(QLabel("Шаг"))
+        bulk_row.addWidget(QLabel('Шаг'))
         bulk_row.addWidget(self.signals_step_spin)
         bulk_row.addWidget(self.signals_reg_combo)
         bulk_row.addWidget(self.signals_type_combo)
         bulk_row.addWidget(self.signals_float_order_combo)
-        bulk_row.addWidget(QLabel("Шкала"))
+        bulk_row.addWidget(QLabel('Шкала'))
         bulk_row.addWidget(self.signals_axis_spin)
         bulk_row.addWidget(self.signals_add_range_btn)
         bulk_row.addStretch(1)
@@ -665,7 +718,7 @@ class MainWindow(QMainWindow):
 
         self.signal_table = QTableWidget(0, 10)
         self.signal_table.setHorizontalHeaderLabels(
-            ["Вкл", "Имя", "Адрес", "Регистр", "Тип", "Бит", "Шкала", "Порядок REAL", "Коэфф.", "Цвет"]
+            ['Вкл', 'Имя', 'Адрес', 'Регистр', 'Тип', 'Бит', 'Шкала', 'Порядок REAL', 'Коэфф.', 'Цвет']
         )
         signal_header = self.signal_table.horizontalHeader()
         signal_header.setStretchLastSection(False)
@@ -673,12 +726,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.signal_table, 1)
 
         signal_buttons = QHBoxLayout()
-        self.add_signal_btn = QPushButton("+ Сигнал")
-        self.copy_signal_btn = QPushButton("Копировать")
-        self.remove_signal_btn = QPushButton("- Сигнал")
-        self.clear_signals_btn = QPushButton("Удалить все")
-        self.save_signals_config_btn = QPushButton("Сохранить конфигурацию")
-        self.signal_columns_btn = QPushButton("Колонки...")
+        self.add_signal_btn = QPushButton('+ Сигнал')
+        self.copy_signal_btn = QPushButton('Копировать')
+        self.remove_signal_btn = QPushButton('- Сигнал')
+        self.clear_signals_btn = QPushButton('Удалить все')
+        self.save_signals_config_btn = QPushButton('Сохранить конфигурацию')
+        self.signal_columns_btn = QPushButton('Колонки...')
         signal_buttons.addWidget(self.add_signal_btn)
         signal_buttons.addWidget(self.copy_signal_btn)
         signal_buttons.addWidget(self.remove_signal_btn)
@@ -698,6 +751,437 @@ class MainWindow(QMainWindow):
 
         self._signal_column_actions: dict[int, QAction] = {}
 
+    def _build_sources_window(self) -> None:
+        flags = (
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.sources_window = QDialog(self, flags)
+        self.sources_window.setWindowTitle('Источники данных (регистраторы)')
+        self.sources_window.resize(900, 460)
+        self.sources_window.setSizeGripEnabled(True)
+        layout = QVBoxLayout(self.sources_window)
+
+        scan_row = QHBoxLayout()
+        self.sources_subnet_edit = QLineEdit()
+        self.sources_subnet_edit.setPlaceholderText('Подсеть, например 192.168.1.0/24')
+        self.sources_subnet_edit.setText(self._guess_local_subnet_for_scan())
+        self.sources_scan_port_spin = QSpinBox()
+        self.sources_scan_port_spin.setRange(1, 65535)
+        self.sources_scan_port_spin.setValue(18777)
+        self.sources_scan_btn = QPushButton('Сканировать сеть')
+        self.sources_scan_btn.clicked.connect(self._on_scan_sources_clicked)
+        scan_row.addWidget(QLabel('Подсеть'))
+        scan_row.addWidget(self.sources_subnet_edit, 1)
+        scan_row.addWidget(QLabel('Порт API'))
+        scan_row.addWidget(self.sources_scan_port_spin)
+        scan_row.addWidget(self.sources_scan_btn)
+        layout.addLayout(scan_row)
+
+        self.sources_table = QTableWidget(0, 7)
+        self.sources_table.setHorizontalHeaderLabels(['Вкл', 'Имя', "Host", 'Порт', "Token", "Recorder ID", 'Статус'])
+        header = self.sources_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for col in range(self.sources_table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        header.sectionResized.connect(lambda *_args: self._on_table_column_resized("sources_table"))
+        self.sources_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.sources_table, 1)
+
+        btn_row = QHBoxLayout()
+        self.sources_add_btn = QPushButton('+ Источник')
+        self.sources_add_btn.clicked.connect(self._on_add_source_clicked)
+        self.sources_remove_btn = QPushButton('- Источник')
+        self.sources_remove_btn.clicked.connect(self._on_remove_source_clicked)
+        self.sources_refresh_btn = QPushButton('Проверить статус')
+        self.sources_refresh_btn.clicked.connect(self._on_refresh_sources_status_clicked)
+        self.sources_import_tags_btn = QPushButton('Импортировать теги в график')
+        self.sources_import_tags_btn.clicked.connect(self._on_import_source_tags_clicked)
+        self.sources_apply_profile_btn = QPushButton('Применить профиль на источник')
+        self.sources_apply_profile_btn.clicked.connect(self._on_apply_profile_to_source_clicked)
+        btn_row.addWidget(self.sources_add_btn)
+        btn_row.addWidget(self.sources_remove_btn)
+        btn_row.addWidget(self.sources_refresh_btn)
+        btn_row.addWidget(self.sources_import_tags_btn)
+        btn_row.addWidget(self.sources_apply_profile_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+    def _guess_local_subnet_for_scan(self) -> str:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect(("8.8.8.8", 80))
+                ip = sock.getsockname()[0]
+            finally:
+                sock.close()
+            net = ipaddress.ip_network(f"{ip}/24", strict=False)
+            return str(net)
+        except Exception:
+            return "192.168.1.0/24"
+
+    def _add_source_row(self, source: RecorderSourceConfig | None = None, status_text: str = "-") -> None:
+        if not isinstance(source, RecorderSourceConfig):
+            source = RecorderSourceConfig(name=f"Recorder {self.sources_table.rowCount() + 1}")
+        row = self.sources_table.rowCount()
+        self.sources_table.insertRow(row)
+
+        enabled_item = QTableWidgetItem()
+        enabled_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        enabled_item.setCheckState(Qt.CheckState.Checked if source.enabled else Qt.CheckState.Unchecked)
+        self.sources_table.setItem(row, 0, enabled_item)
+
+        name_item = QTableWidgetItem(str(source.name))
+        name_item.setData(Qt.ItemDataRole.UserRole, str(source.id))
+        self.sources_table.setItem(row, 1, name_item)
+        self.sources_table.setItem(row, 2, QTableWidgetItem(str(source.host)))
+        self.sources_table.setItem(row, 3, QTableWidgetItem(str(int(source.port))))
+        self.sources_table.setItem(row, 4, QTableWidgetItem(str(source.token)))
+        self.sources_table.setItem(row, 5, QTableWidgetItem(str(source.recorder_id)))
+        status_item = QTableWidgetItem(str(status_text or "-"))
+        status_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+        self.sources_table.setItem(row, 6, status_item)
+
+    def _fill_sources_table(self, sources: list[RecorderSourceConfig]) -> None:
+        self.sources_table.setRowCount(0)
+        for source in sources:
+            self._add_source_row(source, status_text="-")
+        self.sources_table.resizeColumnsToContents()
+        for col in range(self.sources_table.columnCount()):
+            width = self.sources_table.columnWidth(col)
+            self.sources_table.setColumnWidth(col, min(max(56, width + 12), 360))
+        self._refresh_tags_sources_combo()
+
+    def _refresh_tags_sources_combo(self) -> None:
+        if not hasattr(self, "tags_source_combo"):
+            return
+        selected = str(self.tags_source_combo.currentData() or "local")
+        self.tags_source_combo.blockSignals(True)
+        self.tags_source_combo.clear()
+        self.tags_source_combo.addItem('Локальный (прямой Modbus)', "local")
+        for source in self._collect_sources_table():
+            if not source.enabled:
+                continue
+            label = f"{source.name} ({source.host}:{source.port})"
+            self.tags_source_combo.addItem(label, str(source.id))
+        idx = self.tags_source_combo.findData(selected)
+        self.tags_source_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.tags_source_combo.blockSignals(False)
+
+    def _source_by_id(self, source_id: str) -> RecorderSourceConfig | None:
+        sid = str(source_id or "").strip()
+        for source in self._collect_sources_table():
+            if str(source.id) == sid:
+                return source
+        return None
+
+    def _selected_tags_source(self) -> RecorderSourceConfig | None:
+        if not hasattr(self, "tags_source_combo"):
+            return None
+        source_id = str(self.tags_source_combo.currentData() or "local")
+        if source_id == "local":
+            return None
+        return self._source_by_id(source_id)
+
+    def _collect_sources_table(self) -> list[RecorderSourceConfig]:
+        rows: list[RecorderSourceConfig] = []
+        seen_ids: set[str] = set()
+        for row in range(self.sources_table.rowCount()):
+            enabled_item = self.sources_table.item(row, 0)
+            name_item = self.sources_table.item(row, 1)
+            host_item = self.sources_table.item(row, 2)
+            port_item = self.sources_table.item(row, 3)
+            token_item = self.sources_table.item(row, 4)
+            recorder_id_item = self.sources_table.item(row, 5)
+            source_id = str(name_item.data(Qt.ItemDataRole.UserRole) or uuid.uuid4()) if name_item else str(uuid.uuid4())
+            if source_id in seen_ids:
+                source_id = str(uuid.uuid4())
+                if name_item is not None:
+                    name_item.setData(Qt.ItemDataRole.UserRole, source_id)
+            seen_ids.add(source_id)
+            name = (name_item.text().strip() if name_item else "") or f"Recorder {row + 1}"
+            host = (host_item.text().strip() if host_item else "") or "127.0.0.1"
+            try:
+                port = int(port_item.text().strip() if port_item else "18777")
+            except ValueError:
+                port = 18777
+            token = token_item.text().strip() if token_item else ""
+            recorder_id = recorder_id_item.text().strip() if recorder_id_item else ""
+            enabled = bool(enabled_item and enabled_item.checkState() == Qt.CheckState.Checked)
+            rows.append(
+                RecorderSourceConfig(
+                    id=source_id,
+                    name=name,
+                    host=host,
+                    port=max(1, min(65535, int(port))),
+                    token=token,
+                    enabled=enabled,
+                    recorder_id=recorder_id,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _source_base_url(source: RecorderSourceConfig) -> str:
+        return f"http://{source.host}:{int(source.port)}"
+
+    def _source_request_json(
+        self,
+        source: RecorderSourceConfig,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        query: dict[str, object] | None = None,
+        timeout_s: float = 1.2,
+    ) -> dict:
+        base = self._source_base_url(source)
+        url = f"{base}{path}"
+        if query:
+            q = urlparse.urlencode({k: v for k, v in query.items() if v is not None})
+            if q:
+                url = f"{url}?{q}"
+        body = b""
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        token = str(source.token or "").strip()
+        if token:
+            headers["X-Recorder-Token"] = token
+        request = urlrequest.Request(url=url, data=body if method.upper() != "GET" else None, method=method.upper())
+        for k, v in headers.items():
+            request.add_header(k, v)
+        with urlrequest.urlopen(request, timeout=max(0.2, float(timeout_s))) as response:
+            raw = response.read()
+        payload_obj = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload_obj, dict):
+            raise RuntimeError("invalid_response")
+        return payload_obj
+
+    def _probe_source_health(self, source: RecorderSourceConfig, timeout_s: float = 0.5) -> tuple[bool, dict]:
+        try:
+            payload = self._source_request_json(source, "GET", "/v1/health", timeout_s=timeout_s)
+        except urlerror.HTTPError as exc:
+            return False, {"error": f"HTTP {exc.code}"}
+        except Exception as exc:
+            return False, {"error": str(exc)}
+        ok = bool(payload.get("ok", False))
+        return ok, payload
+
+    def _on_add_source_clicked(self, _checked: bool = False) -> None:
+        self._add_source_row()
+        self.sources_table.resizeColumnsToContents()
+        self._refresh_tags_sources_combo()
+        self._mark_config_dirty()
+
+    def _on_remove_source_clicked(self, _checked: bool = False) -> None:
+        selected = sorted({idx.row() for idx in self.sources_table.selectedIndexes()}, reverse=True)
+        for row in selected:
+            self.sources_table.removeRow(row)
+        self._refresh_tags_sources_combo()
+        self._mark_config_dirty()
+
+    def _on_refresh_sources_status_clicked(self, _checked: bool = False) -> None:
+        sources = self._collect_sources_table()
+        for row, source in enumerate(sources):
+            ok, payload = self._probe_source_health(source, timeout_s=0.8)
+            status_item = self.sources_table.item(row, 6)
+            if status_item is None:
+                status_item = QTableWidgetItem("-")
+                status_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                self.sources_table.setItem(row, 6, status_item)
+            if ok:
+                profile_name = str(payload.get("profile_name") or source.name)
+                recorder_id = str(payload.get("recorder_id") or "")
+                if recorder_id:
+                    rec_item = self.sources_table.item(row, 5)
+                    if rec_item is None:
+                        rec_item = QTableWidgetItem(recorder_id)
+                        self.sources_table.setItem(row, 5, rec_item)
+                    else:
+                        rec_item.setText(recorder_id)
+                status_item.setText(f"OK: {profile_name}")
+            else:
+                status_item.setText(f"РћС€РёР±РєР°: {payload.get('error', 'n/a')}")
+        self.status_label.setText('Статус: проверка источников завершена')
+        self._mark_config_dirty()
+
+    def _scan_subnet_for_sources(self, subnet_text: str, port: int) -> list[RecorderSourceConfig]:
+        try:
+            network = ipaddress.ip_network(str(subnet_text).strip(), strict=False)
+        except Exception:
+            raise RuntimeError('Неверный формат подсети. Пример: 192.168.1.0/24')
+        port = max(1, min(65535, int(port)))
+        discovered: list[RecorderSourceConfig] = []
+
+        hosts = [str(ip) for ip in network.hosts()]
+        if not hosts:
+            return discovered
+        if len(hosts) > 4096:
+            raise RuntimeError('Слишком большая подсеть для быстрого сканирования. Используйте, например, /24')
+
+        def probe(host: str) -> RecorderSourceConfig | None:
+            source = RecorderSourceConfig(name=host, host=host, port=port, enabled=True)
+            ok, payload = self._probe_source_health(source, timeout_s=0.35)
+            if not ok:
+                return None
+            source.name = str(payload.get("profile_name") or host)
+            source.recorder_id = str(payload.get("recorder_id") or "")
+            return source
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
+            futures = [executor.submit(probe, host) for host in hosts]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                except Exception:
+                    result = None
+                if isinstance(result, RecorderSourceConfig):
+                    discovered.append(result)
+        discovered.sort(key=lambda item: (item.host, int(item.port)))
+        return discovered
+
+    def _on_scan_sources_clicked(self, _checked: bool = False) -> None:
+        subnet = self.sources_subnet_edit.text().strip() or self._guess_local_subnet_for_scan()
+        port = int(self.sources_scan_port_spin.value())
+        try:
+            found = self._scan_subnet_for_sources(subnet, port)
+        except Exception as exc:
+            self.status_label.setText(f"РћС€РёР±РєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ: {exc}")
+            return
+
+        existing = self._collect_sources_table()
+        by_key = {(item.host, int(item.port)): item for item in existing}
+        added = 0
+        for source in found:
+            key = (source.host, int(source.port))
+            if key in by_key:
+                existing_item = by_key[key]
+                if source.recorder_id:
+                    existing_item.recorder_id = source.recorder_id
+                if source.name and existing_item.name.startswith("Recorder"):
+                    existing_item.name = source.name
+            else:
+                existing.append(source)
+                by_key[key] = source
+                added += 1
+        self._fill_sources_table(existing)
+        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ Р·Р°РІРµСЂС€РµРЅРѕ, РЅР°Р№РґРµРЅРѕ {len(found)}, РґРѕР±Р°РІР»РµРЅРѕ {added}")
+        self._mark_config_dirty()
+
+    def _on_import_source_tags_clicked(self, _checked: bool = False) -> None:
+        selected_rows = sorted({idx.row() for idx in self.sources_table.selectedIndexes()})
+        if not selected_rows:
+            self.status_label.setText('Статус: выберите источник(и) в таблице')
+            return
+        sources = self._collect_sources_table()
+        signals = self._collect_signal_table()
+        existing_keys = {(str(sig.source_id), str(sig.remote_tag_id)) for sig in signals if str(sig.source_id) != "local"}
+        added = 0
+        for row in selected_rows:
+            if row < 0 or row >= len(sources):
+                continue
+            source = sources[row]
+            if not source.enabled:
+                continue
+            try:
+                payload = self._source_request_json(source, "GET", "/v1/tags", timeout_s=1.5)
+            except Exception as exc:
+                self.status_label.setText(f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ С‚РµРіРѕРІ РёР· {source.host}:{source.port}: {exc}")
+                continue
+            raw_tags = payload.get("tags")
+            if not isinstance(raw_tags, list):
+                continue
+            for item in raw_tags:
+                if not isinstance(item, dict):
+                    continue
+                remote_tag_id = str(item.get("id") or "").strip()
+                if not remote_tag_id:
+                    continue
+                key = (str(source.id), remote_tag_id)
+                if key in existing_keys:
+                    continue
+                signal_name = str(item.get("name") or remote_tag_id)
+                signal = SignalConfig(
+                    id=str(uuid.uuid4()),
+                    name=f"{source.name}: {signal_name}",
+                    address=int(item.get("address") or 0),
+                    register_type=str(item.get("register_type") or "holding"),
+                    data_type=str(item.get("data_type") or "int16"),
+                    bit_index=max(0, min(15, int(item.get("bit_index") or 0))),
+                    axis_index=max(1, int(item.get("axis_index") or 1)),
+                    float_order=str(item.get("float_order") or "ABCD"),
+                    scale=float(item.get("scale") or 1.0),
+                    color=str(item.get("color") or DEFAULT_COLORS[(self.signal_table.rowCount() + added) % len(DEFAULT_COLORS)]),
+                    enabled=bool(item.get("enabled", True)),
+                    source_id=str(source.id),
+                    remote_tag_id=remote_tag_id,
+                )
+                self._add_signal_row(signal)
+                existing_keys.add(key)
+                added += 1
+
+        if added > 0:
+            self._fit_signal_table_columns(initial=False)
+            self._apply_current_profile()
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: РёРјРїРѕСЂС‚РёСЂРѕРІР°РЅРѕ С‚РµРіРѕРІ: {added}")
+        else:
+            self.status_label.setText('Статус: новых тегов для импорта не найдено')
+
+    def _build_remote_profile_payload_for_source(self, source_id: str) -> dict:
+        source_sid = str(source_id or "").strip()
+        profile_payload = self.current_profile.to_dict()
+        all_signals = list(self.current_profile.signals)
+        source_signals = [s for s in all_signals if str(getattr(s, "source_id", "local") or "local") == source_sid]
+        local_signals = [s for s in all_signals if str(getattr(s, "source_id", "local") or "local") == "local"]
+        selected_signals = source_signals if source_signals else local_signals
+
+        normalized: list[dict] = []
+        for signal in selected_signals:
+            payload = signal.to_dict()
+            payload["source_id"] = "local"
+            payload["remote_tag_id"] = ""
+            normalized.append(payload)
+
+        profile_payload["signals"] = normalized
+        profile_payload["recorder_sources"] = []
+        profile_payload["work_mode"] = "online"
+        profile_payload["ui_state"] = {}
+        return profile_payload
+
+    def _on_apply_profile_to_source_clicked(self, _checked: bool = False) -> None:
+        selected_rows = sorted({idx.row() for idx in self.sources_table.selectedIndexes()})
+        if not selected_rows:
+            self.status_label.setText('Статус: выберите источник в таблице')
+            return
+        row = int(selected_rows[0])
+        sources = self._collect_sources_table()
+        if row < 0 or row >= len(sources):
+            self.status_label.setText('Статус: выбранный источник не найден')
+            return
+        source = sources[row]
+        payload_profile = self._build_remote_profile_payload_for_source(source.id)
+        try:
+            response = self._source_request_json(
+                source,
+                "PUT",
+                "/v1/config",
+                payload={"profile": payload_profile},
+                timeout_s=2.5,
+            )
+        except Exception as exc:
+            self.status_label.setText(f"РћС€РёР±РєР°: РЅРµ СѓРґР°Р»РѕСЃСЊ РїСЂРёРјРµРЅРёС‚СЊ РїСЂРѕС„РёР»СЊ РЅР° {source.host}:{source.port}: {exc}")
+            return
+        if bool(response.get("ok", False)):
+            self.status_label.setText(
+                f"РЎС‚Р°С‚СѓСЃ: РїСЂРѕС„РёР»СЊ РѕС‚РїСЂР°РІР»РµРЅ РЅР° {source.name} ({source.host}:{source.port}), СЃРёРіРЅР°Р»РѕРІ: {len(payload_profile.get('signals') or [])}"
+            )
+        else:
+            self.status_label.setText(
+                f"РћС€РёР±РєР° РїСЂРёРјРµРЅРµРЅРёСЏ РїСЂРѕС„РёР»СЏ РЅР° {source.name}: {response.get('message') or response.get('error') or 'n/a'}"
+            )
+
     def _build_tags_window(self) -> None:
         flags = (
             Qt.WindowType.Window
@@ -705,14 +1189,14 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self.tags_window = QDialog(self, flags)
-        self.tags_window.setWindowTitle("Регистры Modbus")
+        self.tags_window.setWindowTitle('Регистры Modbus')
         self.tags_window.resize(980, 620)
         self.tags_window.setSizeGripEnabled(True)
         self.tags_window.finished.connect(lambda _code: self._stop_tags_polling(silent=True))
         layout = QVBoxLayout(self.tags_window)
 
         tabs_row = QHBoxLayout()
-        tabs_row.addWidget(QLabel("Вкладки"))
+        tabs_row.addWidget(QLabel('Вкладки'))
         self.tags_tabbar = QTabBar()
         self.tags_tabbar.setMovable(True)
         self.tags_tabbar.setExpanding(False)
@@ -721,15 +1205,19 @@ class MainWindow(QMainWindow):
         self.tags_tabbar.tabMoved.connect(self._on_tags_tab_moved)
         self.tags_tabbar.tabCloseRequested.connect(self._on_tags_tab_close_requested)
         tabs_row.addWidget(self.tags_tabbar, 1)
-        self.tags_add_tab_btn = QPushButton("+ Вкладка")
+        self.tags_add_tab_btn = QPushButton('+ Вкладка')
         self.tags_add_tab_btn.clicked.connect(self._on_add_tags_tab_clicked)
         tabs_row.addWidget(self.tags_add_tab_btn)
-        self.tags_rename_tab_btn = QPushButton("Переименовать")
+        self.tags_rename_tab_btn = QPushButton('Переименовать')
         self.tags_rename_tab_btn.clicked.connect(self._on_rename_tags_tab_clicked)
         tabs_row.addWidget(self.tags_rename_tab_btn)
         layout.addLayout(tabs_row)
 
         bulk_row = QHBoxLayout()
+        self.tags_source_combo = QComboBox()
+        self.tags_source_combo.addItem('Локальный (прямой Modbus)', "local")
+        bulk_row.addWidget(QLabel('Источник'))
+        bulk_row.addWidget(self.tags_source_combo)
         self.tags_start_addr_spin = QSpinBox()
         self.tags_start_addr_spin.setRange(0, 65535)
         self.tags_count_spin = QSpinBox()
@@ -737,26 +1225,26 @@ class MainWindow(QMainWindow):
         self.tags_step_spin = QSpinBox()
         self.tags_step_spin.setRange(1, 1000)
         self.tags_reg_combo = QComboBox()
-        self.tags_reg_combo.addItem("Holding (хран.)", "holding")
-        self.tags_reg_combo.addItem("Input (вход.)", "input")
+        self.tags_reg_combo.addItem('Holding (хран.)', "holding")
+        self.tags_reg_combo.addItem('Input (вход.)', "input")
         self.tags_type_combo = QComboBox()
-        self.tags_type_combo.addItem("INT16 (знак.)", "int16")
-        self.tags_type_combo.addItem("UINT16 (без знака)", "uint16")
+        self.tags_type_combo.addItem('INT16 (знак.)', "int16")
+        self.tags_type_combo.addItem('UINT16 (без знака)', "uint16")
         self.tags_type_combo.addItem("REAL / FLOAT32", "float32")
-        self.tags_type_combo.addItem("BOOL (бит)", "bool")
+        self.tags_type_combo.addItem('BOOL (бит)', "bool")
         self.tags_float_order_combo = QComboBox()
-        self.tags_float_order_combo.addItem("ABCD (обычный)", "ABCD")
+        self.tags_float_order_combo.addItem('ABCD (обычный)', "ABCD")
         self.tags_float_order_combo.addItem("BADC (swap bytes)", "BADC")
         self.tags_float_order_combo.addItem("CDAB (swap words)", "CDAB")
         self.tags_float_order_combo.addItem("DCBA (reverse)", "DCBA")
-        self.tags_add_range_btn = QPushButton("Добавить диапазон")
+        self.tags_add_range_btn = QPushButton('Добавить диапазон')
         self.tags_add_range_btn.clicked.connect(self._on_add_tag_range_clicked)
 
-        bulk_row.addWidget(QLabel("Старт"))
+        bulk_row.addWidget(QLabel('Старт'))
         bulk_row.addWidget(self.tags_start_addr_spin)
-        bulk_row.addWidget(QLabel("Кол-во"))
+        bulk_row.addWidget(QLabel('Кол-во'))
         bulk_row.addWidget(self.tags_count_spin)
-        bulk_row.addWidget(QLabel("Шаг"))
+        bulk_row.addWidget(QLabel('Шаг'))
         bulk_row.addWidget(self.tags_step_spin)
         bulk_row.addWidget(self.tags_reg_combo)
         bulk_row.addWidget(self.tags_type_combo)
@@ -770,11 +1258,11 @@ class MainWindow(QMainWindow):
         self.tags_poll_interval_spin.setRange(100, 600000)
         self.tags_poll_interval_spin.setSingleStep(100)
         self.tags_poll_interval_spin.setSuffix(" ms")
-        self.tags_poll_start_btn = QPushButton("Старт")
-        self.tags_poll_stop_btn = QPushButton("Стоп")
+        self.tags_poll_start_btn = QPushButton('Старт')
+        self.tags_poll_stop_btn = QPushButton('Стоп')
         self.tags_poll_start_btn.clicked.connect(self._start_tags_polling)
         self.tags_poll_stop_btn.clicked.connect(self._stop_tags_polling)
-        poll_row.addWidget(QLabel("Интервал чтения"))
+        poll_row.addWidget(QLabel('Интервал чтения'))
         poll_row.addWidget(self.tags_poll_interval_spin)
         poll_row.addWidget(self.tags_poll_start_btn)
         poll_row.addWidget(self.tags_poll_stop_btn)
@@ -783,7 +1271,7 @@ class MainWindow(QMainWindow):
 
         self.tags_table = QTableWidget(0, 10)
         self.tags_table.setHorizontalHeaderLabels(
-            ["Чтение", "Имя", "Адрес", "Регистр", "Тип", "Бит", "Порядок REAL", "Значение", "Запись", "Статус"]
+            ['Чтение', 'Имя', 'Адрес', 'Регистр', 'Тип', 'Бит', 'Порядок REAL', 'Значение', 'Запись', 'Статус']
         )
         header = self.tags_table.horizontalHeader()
         header.setStretchLastSection(False)
@@ -794,12 +1282,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tags_table, 1)
 
         buttons_row = QHBoxLayout()
-        self.add_tag_btn = QPushButton("+ Тег")
-        self.remove_tag_btn = QPushButton("- Тег")
-        self.clear_tags_btn = QPushButton("Удалить все")
-        self.read_tags_btn = QPushButton("Прочитать отмеченные")
-        self.write_tags_btn = QPushButton("Записать отмеченные")
-        self.save_tags_config_btn = QPushButton("Сохранить конфигурацию")
+        self.add_tag_btn = QPushButton('+ Тег')
+        self.remove_tag_btn = QPushButton('- Тег')
+        self.clear_tags_btn = QPushButton('Удалить все')
+        self.read_tags_btn = QPushButton('Прочитать отмеченные')
+        self.write_tags_btn = QPushButton('Записать отмеченные')
+        self.save_tags_config_btn = QPushButton('Сохранить конфигурацию')
 
         self.add_tag_btn.clicked.connect(self._on_add_tag_clicked)
         self.remove_tag_btn.clicked.connect(self._on_remove_tag_rows_clicked)
@@ -839,7 +1327,7 @@ class MainWindow(QMainWindow):
         while self.tags_tabbar.count() > 0:
             self.tags_tabbar.removeTab(0)
         for idx, tab in enumerate(self._tags_tabs):
-            title = str(tab.name or f"Вкладка {idx + 1}")
+            title = str(tab.name or f"Р’РєР»Р°РґРєР° {idx + 1}")
             self.tags_tabbar.addTab(title)
         if self._tags_tabs:
             bounded = max(0, min(int(target_index), len(self._tags_tabs) - 1))
@@ -880,7 +1368,7 @@ class MainWindow(QMainWindow):
     def _on_add_tags_tab_clicked(self, _checked: bool = False) -> None:
         self._capture_active_tags_tab()
         next_index = len(self._tags_tabs) + 1
-        self._tags_tabs.append(TagTabConfig(name=f"Вкладка {next_index}", tags=[]))
+        self._tags_tabs.append(TagTabConfig(name=f"Р’РєР»Р°РґРєР° {next_index}", tags=[]))
         self._refresh_tags_tabbar(target_index=len(self._tags_tabs) - 1)
         self._active_tags_tab_index = self.tags_tabbar.currentIndex()
         self._load_active_tags_tab_to_table()
@@ -889,8 +1377,8 @@ class MainWindow(QMainWindow):
         idx = int(self.tags_tabbar.currentIndex())
         if idx < 0 or idx >= len(self._tags_tabs):
             return
-        current_name = str(self._tags_tabs[idx].name or f"Вкладка {idx + 1}")
-        new_name, ok = QInputDialog.getText(self, "Переименовать вкладку", "Название вкладки:", text=current_name)
+        current_name = str(self._tags_tabs[idx].name or f"Р’РєР»Р°РґРєР° {idx + 1}")
+        new_name, ok = QInputDialog.getText(self, 'Переименовать вкладку', 'Название вкладки:', text=current_name)
         if not ok:
             return
         cleaned = str(new_name).strip()
@@ -901,7 +1389,7 @@ class MainWindow(QMainWindow):
 
     def _on_tags_tab_close_requested(self, index: int) -> None:
         if len(self._tags_tabs) <= 1:
-            QMessageBox.information(self, "Регистры Modbus", "Должна оставаться минимум одна вкладка.")
+            QMessageBox.information(self, 'Регистры Modbus', 'Должна оставаться минимум одна вкладка.')
             return
         if index < 0 or index >= len(self._tags_tabs):
             return
@@ -912,7 +1400,7 @@ class MainWindow(QMainWindow):
         self._refresh_tags_tabbar(target_index=target)
         self._active_tags_tab_index = self.tags_tabbar.currentIndex()
         self._load_active_tags_tab_to_table()
-        self.status_label.setText(f"Статус: вкладка '{removed_name}' удалена")
+        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: РІРєР»Р°РґРєР° '{removed_name}' СѓРґР°Р»РµРЅР°")
 
     def _sync_tags_poll_buttons(self) -> None:
         running = bool(self._tags_poll_timer.isActive())
@@ -923,7 +1411,7 @@ class MainWindow(QMainWindow):
         interval_ms = max(100, int(self.tags_poll_interval_spin.value()))
         self._tags_poll_timer.start(interval_ms)
         self._sync_tags_poll_buttons()
-        self.status_label.setText(f"Статус: авточтение регистров запущено, интервал {interval_ms} ms")
+        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: Р°РІС‚РѕС‡С‚РµРЅРёРµ СЂРµРіРёСЃС‚СЂРѕРІ Р·Р°РїСѓС‰РµРЅРѕ, РёРЅС‚РµСЂРІР°Р» {interval_ms} ms")
         self._read_tags_once(update_status=True)
 
     def _stop_tags_polling(self, _checked: bool = False, silent: bool = False) -> None:
@@ -931,7 +1419,7 @@ class MainWindow(QMainWindow):
             self._tags_poll_timer.stop()
         self._sync_tags_poll_buttons()
         if not silent:
-            self.status_label.setText("Статус: авточтение регистров остановлено")
+            self.status_label.setText('Статус: авточтение регистров остановлено')
 
     def _on_tags_poll_timer(self) -> None:
         self._read_tags_once(update_status=False)
@@ -1009,17 +1497,17 @@ class MainWindow(QMainWindow):
         self.tags_table.setCellWidget(row, 2, addr_spin)
 
         reg_combo = QComboBox()
-        reg_combo.addItem("Holding (хран.)", "holding")
-        reg_combo.addItem("Input (вход.)", "input")
+        reg_combo.addItem('Holding (хран.)', "holding")
+        reg_combo.addItem('Input (вход.)', "input")
         reg_index = reg_combo.findData(str(tag.register_type or "holding"))
         reg_combo.setCurrentIndex(reg_index if reg_index >= 0 else 0)
         self.tags_table.setCellWidget(row, 3, reg_combo)
 
         type_combo = QComboBox()
-        type_combo.addItem("INT16 (знак.)", "int16")
-        type_combo.addItem("UINT16 (без знака)", "uint16")
+        type_combo.addItem('INT16 (знак.)', "int16")
+        type_combo.addItem('UINT16 (без знака)', "uint16")
         type_combo.addItem("REAL / FLOAT32", "float32")
-        type_combo.addItem("BOOL (бит)", "bool")
+        type_combo.addItem('BOOL (бит)', "bool")
         type_index = type_combo.findData(str(tag.data_type or "int16"))
         type_combo.setCurrentIndex(type_index if type_index >= 0 else 0)
         type_combo.currentIndexChanged.connect(self._on_tag_type_combo_changed)
@@ -1046,7 +1534,7 @@ class MainWindow(QMainWindow):
         value_spin.setValue(float(tag.value))
         self.tags_table.setCellWidget(row, 7, value_spin)
 
-        write_btn = QPushButton("Запись")
+        write_btn = QPushButton('Запись')
         write_btn.clicked.connect(self._on_write_single_tag_row_clicked)
         self.tags_table.setCellWidget(row, 8, write_btn)
 
@@ -1093,19 +1581,19 @@ class MainWindow(QMainWindow):
         tabs_src = profile.tag_tabs
         if not tabs_src:
             if profile.tags:
-                tabs_src = [TagTabConfig(name="Вкладка 1", tags=self._clone_tag_list(profile.tags))]
+                tabs_src = [TagTabConfig(name='Вкладка 1', tags=self._clone_tag_list(profile.tags))]
             else:
-                tabs_src = [TagTabConfig(name="Вкладка 1", tags=[])]
+                tabs_src = [TagTabConfig(name='Вкладка 1', tags=[])]
         self._tags_tabs = [
             TagTabConfig(
                 id=str(tab.id),
-                name=str(tab.name or f"Вкладка {idx + 1}"),
+                name=str(tab.name or f"Р’РєР»Р°РґРєР° {idx + 1}"),
                 tags=self._clone_tag_list(tab.tags),
             )
             for idx, tab in enumerate(tabs_src)
         ]
         if not self._tags_tabs:
-            self._tags_tabs = [TagTabConfig(name="Вкладка 1", tags=[])]
+            self._tags_tabs = [TagTabConfig(name='Вкладка 1', tags=[])]
         self._active_tags_tab_index = 0
         self._refresh_tags_tabbar(target_index=0)
         self._load_active_tags_tab_to_table()
@@ -1171,7 +1659,7 @@ class MainWindow(QMainWindow):
         self._capture_active_tags_tab()
         result: list[TagTabConfig] = []
         for idx, tab in enumerate(self._tags_tabs):
-            name = str(tab.name or f"Вкладка {idx + 1}")
+            name = str(tab.name or f"Р’РєР»Р°РґРєР° {idx + 1}")
             result.append(
                 TagTabConfig(
                     id=str(tab.id or uuid.uuid4()),
@@ -1180,16 +1668,16 @@ class MainWindow(QMainWindow):
                 )
             )
         if not result:
-            result.append(TagTabConfig(name="Вкладка 1", tags=[]))
+            result.append(TagTabConfig(name='Вкладка 1', tags=[]))
         return result
 
     def _write_tag_row_with_client(self, client: ModbusTcpClient, row: int) -> tuple[bool, str]:
         tag = self._collect_tag_row(row)
         if tag is None:
-            return False, "Строка не распознана"
+            return False, 'Строка не распознана'
         value_spin = self.tags_table.cellWidget(row, 7)
         if not isinstance(value_spin, QDoubleSpinBox):
-            return False, "Нет поля значения"
+            return False, 'Нет поля значения'
         value = float(value_spin.value())
         old_value: float | None = None
         try:
@@ -1198,7 +1686,7 @@ class MainWindow(QMainWindow):
             old_value = None
         self._write_single_tag(client, tag, value)
         if old_value is None:
-            return True, f"{tag.name} MW{tag.address}: записано {value:.6g}"
+            return True, f"{tag.name} MW{tag.address}: Р·Р°РїРёСЃР°РЅРѕ {value:.6g}"
         return True, f"{tag.name} MW{tag.address}: {old_value:.6g} -> {value:.6g}"
 
     def _on_write_single_tag_row_clicked(self, _checked: bool = False) -> None:
@@ -1208,23 +1696,34 @@ class MainWindow(QMainWindow):
         row = self._table_row_for_widget(self.tags_table, button, 8)
         if row < 0:
             return
-        client = self._open_tags_client()
-        if client is None:
-            self._set_tag_row_status(row, "Нет связи", error=True)
+        source = self._selected_tags_source()
+        if source is None:
+            client = self._open_tags_client()
+            if client is None:
+                self._set_tag_row_status(row, 'Нет связи', error=True)
+                return
+            try:
+                try:
+                    _ok, message = self._write_tag_row_with_client(client, row)
+                    self._set_tag_row_status(row, 'Записано', error=False)
+                    self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: {message}")
+                except Exception as exc:
+                    self._set_tag_row_status(row, 'Ошибка записи', error=True)
+                    self.status_label.setText(f"РћС€РёР±РєР° Р·Р°РїРёСЃРё СЃС‚СЂРѕРєРё {row + 1}: {exc}")
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
             return
+
         try:
-            try:
-                _ok, message = self._write_tag_row_with_client(client, row)
-                self._set_tag_row_status(row, "Записано", error=False)
-                self.status_label.setText(f"Статус: {message}")
-            except Exception as exc:
-                self._set_tag_row_status(row, "Ошибка записи", error=True)
-                self.status_label.setText(f"Ошибка записи строки {row + 1}: {exc}")
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+            _ok, message = self._write_tag_row_remote(source, row)
+            self._set_tag_row_status(row, 'Записано', error=False)
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: {message}")
+        except Exception as exc:
+            self._set_tag_row_status(row, 'Ошибка записи', error=True)
+            self.status_label.setText(f"РћС€РёР±РєР° Р·Р°РїРёСЃРё СЃС‚СЂРѕРєРё {row + 1}: {exc}")
 
     def _on_add_tag_clicked(self, _checked: bool = False) -> None:
         self._add_tag_row()
@@ -1241,8 +1740,8 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            "Регистры Modbus",
-            "Удалить все теги из таблицы?",
+            'Регистры Modbus',
+            'Удалить все теги из таблицы?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1250,7 +1749,7 @@ class MainWindow(QMainWindow):
             return
         self.tags_table.setRowCount(0)
         self._fit_tags_table_columns(initial=False)
-        self.status_label.setText("Статус: все регистры удалены из таблицы")
+        self.status_label.setText('Статус: все регистры удалены из таблицы')
 
     def _on_add_tag_range_clicked(self, _checked: bool = False) -> None:
         start_address = int(self.tags_start_addr_spin.value())
@@ -1275,7 +1774,7 @@ class MainWindow(QMainWindow):
             self._add_tag_row(tag)
         self._fit_tags_table_columns(initial=False)
         self.status_label.setText(
-            f"Статус: добавлено {count} регистров (старт={start_address}, шаг={step}, тип={data_type})"
+            f"РЎС‚Р°С‚СѓСЃ: РґРѕР±Р°РІР»РµРЅРѕ {count} СЂРµРіРёСЃС‚СЂРѕРІ (СЃС‚Р°СЂС‚={start_address}, С€Р°Рі={step}, С‚РёРї={data_type})"
         )
 
     def _open_tags_client(self) -> ModbusTcpClient | None:
@@ -1287,10 +1786,10 @@ class MainWindow(QMainWindow):
         try:
             ok = bool(client.connect())
         except Exception as exc:
-            self.status_label.setText(f"Ошибка: подключение к {self.current_profile.ip}:{self.current_profile.port} не удалось")
+            self.status_label.setText(f"РћС€РёР±РєР°: РїРѕРґРєР»СЋС‡РµРЅРёРµ Рє {self.current_profile.ip}:{self.current_profile.port} РЅРµ СѓРґР°Р»РѕСЃСЊ")
             return None
         if not ok:
-            self.status_label.setText(f"Ошибка: подключение к {self.current_profile.ip}:{self.current_profile.port} не удалось")
+            self.status_label.setText(f"РћС€РёР±РєР°: РїРѕРґРєР»СЋС‡РµРЅРёРµ Рє {self.current_profile.ip}:{self.current_profile.port} РЅРµ СѓРґР°Р»РѕСЃСЊ")
             return None
         return client
 
@@ -1308,24 +1807,24 @@ class MainWindow(QMainWindow):
 
     def _write_single_tag(self, client: ModbusTcpClient, tag: TagConfig, write_value: float) -> None:
         if tag.register_type == "input":
-            raise RuntimeError("Input-регистры доступны только для чтения")
+            raise RuntimeError('Input-регистры доступны только для чтения')
         address = max(0, int(tag.address) + int(self.current_profile.address_offset))
         if tag.data_type == "int16":
             raw = int(round(write_value))
             if raw < -32768 or raw > 32767:
-                raise RuntimeError("INT16 вне диапазона -32768..32767")
+                raise RuntimeError('INT16 вне диапазона -32768..32767')
             response = ModbusWorker._write_single_register(client, address, raw & 0xFFFF, self.current_profile.unit_id)
         elif tag.data_type == "uint16":
             raw = int(round(write_value))
             if raw < 0 or raw > 65535:
-                raise RuntimeError("UINT16 вне диапазона 0..65535")
+                raise RuntimeError('UINT16 вне диапазона 0..65535')
             response = ModbusWorker._write_single_register(client, address, raw, self.current_profile.unit_id)
         elif tag.data_type == "bool":
             bit = max(0, min(15, int(tag.bit_index)))
             desired = 1 if int(round(write_value)) != 0 else 0
             current = ModbusWorker._read_holding_registers(client, address, 1, self.current_profile.unit_id)
             if current.isError():
-                raise RuntimeError(f"Ошибка чтения регистра перед записью BOOL: {current}")
+                raise RuntimeError(f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ СЂРµРіРёСЃС‚СЂР° РїРµСЂРµРґ Р·Р°РїРёСЃСЊСЋ BOOL: {current}")
             current_reg = int(current.registers[0]) if current.registers else 0
             if desired:
                 raw = current_reg | (1 << bit)
@@ -1334,16 +1833,73 @@ class MainWindow(QMainWindow):
             response = ModbusWorker._write_single_register(client, address, raw & 0xFFFF, self.current_profile.unit_id)
         else:
             if not math.isfinite(float(write_value)):
-                raise RuntimeError("FLOAT32 должен быть конечным числом")
+                raise RuntimeError('FLOAT32 должен быть конечным числом')
             reg0, reg1 = ModbusWorker._encode_float32_words(float(write_value), tag.float_order)
             response = ModbusWorker._write_multiple_registers(client, address, [reg0, reg1], self.current_profile.unit_id)
         if response.isError():
             raise RuntimeError(str(response))
 
+    def _read_single_tag_remote(self, source: RecorderSourceConfig, tag: TagConfig) -> float:
+        payload = self._source_request_json(
+            source,
+            "POST",
+            "/v1/modbus/read",
+            payload={
+                "address": int(tag.address),
+                "register_type": str(tag.register_type),
+                "data_type": str(tag.data_type),
+                "bit_index": int(tag.bit_index),
+                "float_order": str(tag.float_order),
+            },
+            timeout_s=1.5,
+        )
+        if not bool(payload.get("ok", False)):
+            raise RuntimeError(str(payload.get("error") or "read_failed"))
+        return float(payload.get("value", 0.0))
+
+    def _write_single_tag_remote(self, source: RecorderSourceConfig, tag: TagConfig, write_value: float) -> None:
+        payload = self._source_request_json(
+            source,
+            "POST",
+            "/v1/modbus/write",
+            payload={
+                "address": int(tag.address),
+                "register_type": str(tag.register_type),
+                "data_type": str(tag.data_type),
+                "bit_index": int(tag.bit_index),
+                "float_order": str(tag.float_order),
+                "value": float(write_value),
+            },
+            timeout_s=1.5,
+        )
+        if not bool(payload.get("ok", False)):
+            raise RuntimeError(str(payload.get("error") or "write_failed"))
+
+    def _write_tag_row_remote(self, source: RecorderSourceConfig, row: int) -> tuple[bool, str]:
+        tag = self._collect_tag_row(row)
+        if tag is None:
+            return False, 'Строка не распознана'
+        value_spin = self.tags_table.cellWidget(row, 7)
+        if not isinstance(value_spin, QDoubleSpinBox):
+            return False, 'Нет поля значения'
+        value = float(value_spin.value())
+        old_value: float | None = None
+        try:
+            old_value = self._read_single_tag_remote(source, tag)
+        except Exception:
+            old_value = None
+        self._write_single_tag_remote(source, tag, value)
+        if old_value is None:
+            return True, f"{source.name}/{tag.name} MW{tag.address}: Р·Р°РїРёСЃР°РЅРѕ {value:.6g}"
+        return True, f"{source.name}/{tag.name} MW{tag.address}: {old_value:.6g} -> {value:.6g}"
+
     def _read_tags_once(self, update_status: bool = True) -> tuple[int, int]:
-        client = self._open_tags_client()
-        if client is None:
-            return 0, 0
+        source = self._selected_tags_source()
+        client: ModbusTcpClient | None = None
+        if source is None:
+            client = self._open_tags_client()
+            if client is None:
+                return 0, 0
         ok_count = 0
         fail_count = 0
         try:
@@ -1356,34 +1912,44 @@ class MainWindow(QMainWindow):
                     continue
                 try:
                     old_value = float(value_spin.value())
-                    new_value = self._read_single_tag(client, tag)
+                    if source is None:
+                        new_value = self._read_single_tag(client, tag)  # type: ignore[arg-type]
+                    else:
+                        new_value = self._read_single_tag_remote(source, tag)
                     value_spin.blockSignals(True)
                     value_spin.setValue(new_value)
                     value_spin.blockSignals(False)
-                    self._set_tag_row_status(row, "Прочитано", error=False)
+                    self._set_tag_row_status(row, 'Прочитано', error=False)
                     ok_count += 1
                 except Exception as exc:
-                    self._set_tag_row_status(row, "Ошибка чтения", error=True)
+                    self._set_tag_row_status(row, 'Ошибка чтения', error=True)
                     fail_count += 1
                     if update_status:
-                        self.status_label.setText(f"Ошибка чтения {tag.name}: {exc}")
+                        self.status_label.setText(f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ {tag.name}: {exc}")
         finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
         if update_status:
-            self.status_label.setText(f"Статус: чтение регистров завершено (успешно {ok_count}, ошибок {fail_count})")
+            src_text = 'локальный Modbus' if source is None else f"{source.name} ({source.host}:{source.port})"
+            self.status_label.setText(
+                f"РЎС‚Р°С‚СѓСЃ: С‡С‚РµРЅРёРµ СЂРµРіРёСЃС‚СЂРѕРІ Р·Р°РІРµСЂС€РµРЅРѕ [{src_text}] (СѓСЃРїРµС€РЅРѕ {ok_count}, РѕС€РёР±РѕРє {fail_count})"
+            )
         return ok_count, fail_count
 
     def _on_read_tags_clicked(self, _checked: bool = False) -> None:
         self._read_tags_once(update_status=True)
 
     def _on_write_tags_clicked(self, _checked: bool = False) -> None:
-        client = self._open_tags_client()
-        if client is None:
-            return
+        source = self._selected_tags_source()
+        client: ModbusTcpClient | None = None
+        if source is None:
+            client = self._open_tags_client()
+            if client is None:
+                return
         ok_count = 0
         fail_count = 0
         try:
@@ -1392,27 +1958,34 @@ class MainWindow(QMainWindow):
                 if tag is None or not tag.read_enabled:
                     continue
                 try:
-                    _ok, _message = self._write_tag_row_with_client(client, row)
-                    self._set_tag_row_status(row, "Записано", error=False)
+                    if source is None:
+                        _ok, _message = self._write_tag_row_with_client(client, row)  # type: ignore[arg-type]
+                    else:
+                        _ok, _message = self._write_tag_row_remote(source, row)
+                    self._set_tag_row_status(row, 'Записано', error=False)
                     ok_count += 1
                 except Exception as exc:
-                    self._set_tag_row_status(row, "Ошибка записи", error=True)
+                    self._set_tag_row_status(row, 'Ошибка записи', error=True)
                     fail_count += 1
-                    self.status_label.setText(f"Ошибка записи {tag.name}: {exc}")
+                    self.status_label.setText(f"РћС€РёР±РєР° Р·Р°РїРёСЃРё {tag.name}: {exc}")
         finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
-        self.status_label.setText(f"Статус: запись регистров завершена (успешно {ok_count}, ошибок {fail_count})")
+        src_text = 'локальный Modbus' if source is None else f"{source.name} ({source.host}:{source.port})"
+        self.status_label.setText(
+            f"РЎС‚Р°С‚СѓСЃ: Р·Р°РїРёСЃСЊ СЂРµРіРёСЃС‚СЂРѕРІ Р·Р°РІРµСЂС€РµРЅР° [{src_text}] (СѓСЃРїРµС€РЅРѕ {ok_count}, РѕС€РёР±РѕРє {fail_count})"
+        )
 
     def _save_from_tags_window(self) -> None:
         self._store_ui_to_profile(self.current_profile)
         self.app_config.active_profile_id = self.current_profile.id
         self.config_store.save(self.app_config)
         self._save_recorder_config_snapshot(silent=True)
-        self.status_label.setText("Статус: конфигурация (включая теги) сохранена")
+        self.status_label.setText('Статус: конфигурация (включая теги) сохранена')
 
     def _build_scales_window(self) -> None:
         flags = (
@@ -1421,13 +1994,13 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self.scales_window = QDialog(self, flags)
-        self.scales_window.setWindowTitle("Настройка шкал")
+        self.scales_window.setWindowTitle('Настройка шкал')
         self.scales_window.resize(700, 380)
         self.scales_window.setSizeGripEnabled(True)
         layout = QVBoxLayout(self.scales_window)
 
         self.scales_table = QTableWidget(0, 5)
-        self.scales_table.setHorizontalHeaderLabels(["Шкала", "Авто Y", "Мин", "Макс", "Сигналы"])
+        self.scales_table.setHorizontalHeaderLabels(['Шкала', 'Авто Y', 'Мин', 'Макс', 'Сигналы'])
         scales_header = self.scales_table.horizontalHeader()
         scales_header.setStretchLastSection(False)
         for col in range(self.scales_table.columnCount()):
@@ -1444,7 +2017,7 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self.graph_settings_window = QDialog(self, flags)
-        self.graph_settings_window.setWindowTitle("Настройки графика")
+        self.graph_settings_window.setWindowTitle('Настройки графика')
         self.graph_settings_window.resize(420, 260)
         self.graph_settings_window.setSizeGripEnabled(True)
         layout = QVBoxLayout(self.graph_settings_window)
@@ -1457,20 +2030,20 @@ class MainWindow(QMainWindow):
         self.graph_grid_alpha_spin = QSpinBox()
         self.graph_grid_alpha_spin.setRange(0, 100)
         self.graph_grid_alpha_spin.setSuffix(" %")
-        self.graph_grid_x_checkbox = QCheckBox("Вертикальная (X)")
-        self.graph_grid_y_checkbox = QCheckBox("Горизонтальная (Y)")
+        self.graph_grid_x_checkbox = QCheckBox('Вертикальная (X)')
+        self.graph_grid_y_checkbox = QCheckBox('Горизонтальная (Y)')
 
-        form.addRow("Цвет фона", self.graph_bg_btn)
-        form.addRow("Цвет сетки", self.graph_grid_color_btn)
-        form.addRow("Прозрачность сетки", self.graph_grid_alpha_spin)
-        form.addRow("Сетка X", self.graph_grid_x_checkbox)
-        form.addRow("Сетка Y", self.graph_grid_y_checkbox)
+        form.addRow('Цвет фона', self.graph_bg_btn)
+        form.addRow('Цвет сетки', self.graph_grid_color_btn)
+        form.addRow('Прозрачность сетки', self.graph_grid_alpha_spin)
+        form.addRow('Сетка X', self.graph_grid_x_checkbox)
+        form.addRow('Сетка Y', self.graph_grid_y_checkbox)
         layout.addLayout(form)
 
         apply_row = QHBoxLayout()
-        self.graph_apply_btn = QPushButton("Применить")
+        self.graph_apply_btn = QPushButton('Применить')
         self.graph_apply_btn.clicked.connect(self._apply_graph_settings_from_ui)
-        self.graph_reset_btn = QPushButton("Сброс")
+        self.graph_reset_btn = QPushButton('Сброс')
         self.graph_reset_btn.clicked.connect(self._reset_graph_settings_ui)
         apply_row.addWidget(self.graph_apply_btn)
         apply_row.addWidget(self.graph_reset_btn)
@@ -1484,19 +2057,19 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.WindowCloseButtonHint
         )
         self.statistics_window = QDialog(self, flags)
-        self.statistics_window.setWindowTitle("Анализ участка графика")
+        self.statistics_window.setWindowTitle('Анализ участка графика')
         self.statistics_window.resize(920, 480)
         self.statistics_window.setSizeGripEnabled(True)
         layout = QVBoxLayout(self.statistics_window)
 
         controls_row = QHBoxLayout()
-        self.stats_markers_checkbox = QCheckBox("Статистика по 2-м точкам")
+        self.stats_markers_checkbox = QCheckBox('Статистика по 2-м точкам')
         self.stats_markers_checkbox.toggled.connect(self._on_stats_markers_toggled)
         controls_row.addWidget(self.stats_markers_checkbox)
-        self.stats_from_markers_btn = QPushButton("Применить 2 точки")
+        self.stats_from_markers_btn = QPushButton('Применить 2 точки')
         self.stats_from_markers_btn.clicked.connect(self._on_stats_from_markers_clicked)
         controls_row.addWidget(self.stats_from_markers_btn)
-        self.stats_from_view_btn = QPushButton("Период из видимой области")
+        self.stats_from_view_btn = QPushButton('Период из видимой области')
         self.stats_from_view_btn.clicked.connect(self._on_stats_from_view_clicked)
         controls_row.addWidget(self.stats_from_view_btn)
         controls_row.addStretch(1)
@@ -1511,15 +2084,15 @@ class MainWindow(QMainWindow):
         self.stats_end_edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss.zzz")
         self.stats_start_edit.dateTimeChanged.connect(self._on_stats_period_changed)
         self.stats_end_edit.dateTimeChanged.connect(self._on_stats_period_changed)
-        period_form.addRow("Начало периода", self.stats_start_edit)
-        period_form.addRow("Конец периода", self.stats_end_edit)
+        period_form.addRow('Начало периода', self.stats_start_edit)
+        period_form.addRow('Конец периода', self.stats_end_edit)
         layout.addLayout(period_form)
 
-        self.stats_interval_label = QLabel("Интервал: -")
+        self.stats_interval_label = QLabel('Интервал: -')
         layout.addWidget(self.stats_interval_label)
 
         calc_row = QHBoxLayout()
-        self.stats_calc_btn = QPushButton("Рассчитать")
+        self.stats_calc_btn = QPushButton('Рассчитать')
         self.stats_calc_btn.clicked.connect(self._calculate_statistics)
         calc_row.addWidget(self.stats_calc_btn)
         calc_row.addStretch(1)
@@ -1527,7 +2100,7 @@ class MainWindow(QMainWindow):
 
         self.stats_table = QTableWidget(0, 7)
         self.stats_table.setHorizontalHeaderLabels(
-            ["Сигнал", "Мин", "Макс", "Среднее", "Скорость, ед/с", "Интервал, с", "Точек"]
+            ['Сигнал', 'Мин', 'Макс', 'Среднее', 'Скорость, ед/с', 'Интервал, с', 'Точек']
         )
         header = self.stats_table.horizontalHeader()
         header.setStretchLastSection(False)
@@ -1568,7 +2141,7 @@ class MainWindow(QMainWindow):
         start_ts, end_ts = self._stats_period()
         delta = max(0.0, float(end_ts - start_ts))
         self.stats_interval_label.setText(
-            f"Интервал: {format_ts_ms(start_ts)} .. {format_ts_ms(end_ts)} ({delta:.3f} с)"
+            f"РРЅС‚РµСЂРІР°Р»: {format_ts_ms(start_ts)} .. {format_ts_ms(end_ts)} ({delta:.3f} СЃ)"
         )
 
     def _on_stats_period_changed(self, _date_time: QDateTime) -> None:
@@ -1605,7 +2178,7 @@ class MainWindow(QMainWindow):
             self.stats_markers_checkbox.setChecked(True)
         points = self.chart.get_stats_range()
         if points is None:
-            self.status_label.setText("Статус: двухточечный режим не включен")
+            self.status_label.setText('Статус: двухточечный режим не включен')
             return
         self._disable_auto_x_for_stats()
         self._set_stats_period(points[0], points[1])
@@ -1657,14 +2230,14 @@ class MainWindow(QMainWindow):
                     header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
             self._stats_table_fitted_once = True
         self._update_stats_interval_label()
-        self.status_label.setText(f"Статус: статистика рассчитана, сигналов: {len(rows)}")
+        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: СЃС‚Р°С‚РёСЃС‚РёРєР° СЂР°СЃСЃС‡РёС‚Р°РЅР°, СЃРёРіРЅР°Р»РѕРІ: {len(rows)}")
 
     def _build_menu_bar(self) -> None:
         menu_bar = self.menuBar()
 
-        control_menu = menu_bar.addMenu("Управление")
-        self.action_mode_online = QAction("Режим: Онлайн", self, checkable=True)
-        self.action_mode_offline = QAction("Режим: Офлайн", self, checkable=True)
+        control_menu = menu_bar.addMenu('Рабочий процесс')
+        self.action_mode_online = QAction('Режим: Онлайн (запись/просмотр)', self, checkable=True)
+        self.action_mode_offline = QAction('Режим: Офлайн (анализ архива)', self, checkable=True)
         self.mode_action_group = QActionGroup(self)
         self.mode_action_group.setExclusive(True)
         self.mode_action_group.addAction(self.action_mode_online)
@@ -1674,107 +2247,118 @@ class MainWindow(QMainWindow):
         control_menu.addAction(self.action_mode_online)
         control_menu.addAction(self.action_mode_offline)
         control_menu.addSeparator()
-        self.action_start = QAction("Старт просмотра (из БД)", self)
+        self.action_start = QAction('3) Старт (подключить и показать данные)', self)
         self.action_start.triggered.connect(self._start_worker)
         control_menu.addAction(self.action_start)
-        self.action_stop = QAction("Стоп просмотра", self)
+        self.action_stop = QAction('4) Стоп', self)
         self.action_stop.triggered.connect(self._stop_worker)
         control_menu.addAction(self.action_stop)
         control_menu.addSeparator()
-        self.action_recorder_start = QAction("Старт внешнего регистратора", self)
+        self.action_recorder_start = QAction('Запустить внешний регистратор', self)
         self.action_recorder_start.triggered.connect(self._start_external_recorder)
         control_menu.addAction(self.action_recorder_start)
-        self.action_recorder_stop = QAction("Стоп внешнего регистратора", self)
+        self.action_recorder_start.setVisible(False)
+        self.action_recorder_start.setEnabled(False)
+        self.action_recorder_stop = QAction('Остановить внешний регистратор', self)
         self.action_recorder_stop.triggered.connect(self._stop_external_recorder)
         control_menu.addAction(self.action_recorder_stop)
-        self.action_recorder_status = QAction("Статус регистратора...", self)
+        self.action_recorder_stop.setVisible(False)
+        self.action_recorder_stop.setEnabled(False)
+        self.action_recorder_status = QAction('Статус регистратора...', self)
         self.action_recorder_status.triggered.connect(self._show_external_recorder_status)
         control_menu.addAction(self.action_recorder_status)
 
-        windows_menu = menu_bar.addMenu("Окна")
-        self.action_connection = QAction("Подключение...", self)
-        self.action_connection.triggered.connect(lambda: self._show_tool_window(self.connection_window))
+        windows_menu = menu_bar.addMenu('Настройка')
+        self.action_connection = QAction('1) Подключение...', self)
+        self.action_connection.triggered.connect(lambda: self._show_tool_window(self.connection_window, True))
         windows_menu.addAction(self.action_connection)
 
-        self.action_signals = QAction("Сигналы графика...", self)
-        self.action_signals.triggered.connect(lambda: self._show_tool_window(self.signals_window))
+        self.action_signals = QAction('2) Сигналы графика...', self)
+        self.action_signals.triggered.connect(lambda: self._show_tool_window(self.signals_window, True))
         windows_menu.addAction(self.action_signals)
 
-        self.action_tags = QAction("Регистры Modbus...", self)
-        self.action_tags.triggered.connect(lambda: self._show_tool_window(self.tags_window))
-        windows_menu.addAction(self.action_tags)
+        windows_menu.addSeparator()
+        advanced_windows_menu = windows_menu.addMenu('Дополнительно')
 
-        self.action_scales = QAction("Шкалы...", self)
-        self.action_scales.triggered.connect(lambda: self._show_tool_window(self.scales_window))
-        windows_menu.addAction(self.action_scales)
-        self.action_graph_settings = QAction("График...", self)
+        self.action_sources = QAction('Источники данных...', self)
+        self.action_sources.triggered.connect(lambda: self._show_tool_window(self.sources_window, True))
+        advanced_windows_menu.addAction(self.action_sources)
+
+        self.action_tags = QAction('Регистры Modbus...', self)
+        self.action_tags.triggered.connect(lambda: self._show_tool_window(self.tags_window, True))
+        advanced_windows_menu.addAction(self.action_tags)
+
+        self.action_scales = QAction('Шкалы...', self)
+        self.action_scales.triggered.connect(lambda: self._show_tool_window(self.scales_window, True))
+        advanced_windows_menu.addAction(self.action_scales)
+        self.action_graph_settings = QAction('График...', self)
         self.action_graph_settings.triggered.connect(lambda: self._show_tool_window(self.graph_settings_window))
-        windows_menu.addAction(self.action_graph_settings)
-        self.action_statistics = QAction("Статистика...", self)
+        advanced_windows_menu.addAction(self.action_graph_settings)
+        self.action_statistics = QAction('Статистика...', self)
         self.action_statistics.triggered.connect(self._show_statistics_window)
-        windows_menu.addAction(self.action_statistics)
+        advanced_windows_menu.addAction(self.action_statistics)
 
-        archive_menu = menu_bar.addMenu("Архив и экспорт")
-        self.action_archive_write_db = QAction("Писать в БД", self, checkable=True)
+        archive_menu = menu_bar.addMenu('Архив и экспорт')
+        self.action_archive_write_db = QAction('Писать в БД', self, checkable=True)
         self.action_archive_write_db.setChecked(True)
         self.action_archive_write_db.triggered.connect(self._on_archive_write_db_toggled)
         archive_menu.addAction(self.action_archive_write_db)
         archive_menu.addSeparator()
-        self.action_save_archive = QAction("Сохранить архив...", self)
+        self.action_save_archive = QAction('Сохранить архив...', self)
         self.action_save_archive.triggered.connect(self._save_archive_to_file)
         archive_menu.addAction(self.action_save_archive)
-        self.action_load_archive = QAction("Загрузить архив...", self)
+        self.action_load_archive = QAction('Загрузить архив...', self)
         self.action_load_archive.triggered.connect(self._load_archive_from_file)
         archive_menu.addAction(self.action_load_archive)
         archive_menu.addSeparator()
-        self.action_export_chart_image = QAction("График в PNG/JPG...", self)
+        self.action_export_chart_image = QAction('График в PNG/JPG...', self)
         self.action_export_chart_image.triggered.connect(self._export_chart_image)
         archive_menu.addAction(self.action_export_chart_image)
-        self.action_export_chart_csv = QAction("Данные графика в CSV...", self)
+        self.action_export_chart_csv = QAction('Данные графика в CSV...', self)
         self.action_export_chart_csv.triggered.connect(self._export_chart_csv)
         archive_menu.addAction(self.action_export_chart_csv)
-        self.action_print_chart = QAction("Печать графика...", self)
+        self.action_print_chart = QAction('Печать графика...', self)
         self.action_print_chart.triggered.connect(self._print_chart)
         archive_menu.addAction(self.action_print_chart)
         archive_menu.addSeparator()
-        self.action_export_connection_config = QAction("Экспорт подключения...", self)
+        self.action_export_connection_config = QAction('Экспорт подключения...', self)
         self.action_export_connection_config.triggered.connect(self._save_connection_config_to_file)
         archive_menu.addAction(self.action_export_connection_config)
-        self.action_import_connection_config = QAction("Импорт подключения...", self)
+        self.action_import_connection_config = QAction('Импорт подключения...', self)
         self.action_import_connection_config.triggered.connect(self._load_connection_config_from_file)
         archive_menu.addAction(self.action_import_connection_config)
 
-        view_menu = menu_bar.addMenu("Вид")
-        self.action_auto_x = QAction("Авто X", self, checkable=True)
+        view_menu = menu_bar.addMenu('Вид')
+        self.action_auto_x = QAction('Авто X', self, checkable=True)
         self.action_auto_x.setChecked(True)
         self.action_auto_x.triggered.connect(self._on_action_auto_x_toggled)
         view_menu.addAction(self.action_auto_x)
-        self.action_cursor = QAction("Курсор", self, checkable=True)
+        self.action_cursor = QAction('Курсор', self, checkable=True)
         self.action_cursor.setChecked(False)
         self.action_cursor.triggered.connect(self._on_action_cursor_toggled)
         view_menu.addAction(self.action_cursor)
-        self.action_reset_zoom = QAction("Сброс масштаба", self)
+        self.action_reset_zoom = QAction('Сброс масштаба', self)
         self.action_reset_zoom.triggered.connect(lambda _checked=False: self.chart.reset_view())
         view_menu.addAction(self.action_reset_zoom)
         view_menu.addSeparator()
-        self.action_values_panel = QAction("Таблица значений", self, checkable=True)
+        self.action_values_panel = QAction('Таблица значений', self, checkable=True)
         self.action_values_panel.setChecked(True)
         self.action_values_panel.triggered.connect(self._on_values_panel_menu_toggled)
         view_menu.addAction(self.action_values_panel)
 
-        app_menu = menu_bar.addMenu("Приложение")
-        self.action_save_config = QAction("Сохранить конфигурацию", self)
+        app_menu = menu_bar.addMenu('Приложение')
+        self.action_save_config = QAction('Сохранить конфигурацию', self)
         self.action_save_config.triggered.connect(self._save_config)
         app_menu.addAction(self.action_save_config)
         app_menu.addSeparator()
-        self.action_minimize_tray = QAction("Свернуть в трей", self)
+        self.action_minimize_tray = QAction('Свернуть в трей', self)
         self.action_minimize_tray.triggered.connect(self._minimize_to_tray)
         app_menu.addAction(self.action_minimize_tray)
         app_menu.addSeparator()
-        close_menu = app_menu.addMenu("При закрытии")
-        self.action_close_ask = QAction("При закрытии: запрашивать действие", self, checkable=True)
-        self.action_close_to_tray = QAction("При закрытии: сворачивать в трей", self, checkable=True)
-        self.action_close_exit = QAction("При закрытии: завершать программу", self, checkable=True)
+        close_menu = app_menu.addMenu('При закрытии')
+        self.action_close_ask = QAction('При закрытии: запрашивать действие', self, checkable=True)
+        self.action_close_to_tray = QAction('При закрытии: сворачивать в трей', self, checkable=True)
+        self.action_close_exit = QAction('При закрытии: завершать программу', self, checkable=True)
         self.close_action_group = QActionGroup(self)
         self.close_action_group.setExclusive(True)
         for action in (self.action_close_ask, self.action_close_to_tray, self.action_close_exit):
@@ -1785,19 +2369,21 @@ class MainWindow(QMainWindow):
         self.action_close_exit.triggered.connect(lambda checked: self._set_close_behavior("exit", checked))
 
         close_menu.addSeparator()
-        self.action_windows_autostart = QAction("Автозапуск при старте Windows", self, checkable=True)
+        self.action_windows_autostart = QAction('Автозапуск при старте Windows', self, checkable=True)
         self.action_windows_autostart.triggered.connect(self._on_action_windows_autostart_toggled)
         app_menu.addAction(self.action_windows_autostart)
-        self.action_auto_connect_startup = QAction("Автостарт просмотра при запуске", self, checkable=True)
+        self.action_auto_connect_startup = QAction('Автостарт просмотра при запуске', self, checkable=True)
         self.action_auto_connect_startup.triggered.connect(self._on_action_auto_connect_startup_toggled)
         app_menu.addAction(self.action_auto_connect_startup)
         app_menu.addSeparator()
-        self.action_exit = QAction("Выход", self)
+        self.action_exit = QAction('Выход', self)
         self.action_exit.triggered.connect(self._exit_from_tray)
         app_menu.addAction(self.action_exit)
 
-    @staticmethod
-    def _show_tool_window(window: QDialog) -> None:
+    def _show_tool_window(self, window: QDialog, requires_recorder: bool = False) -> None:
+        if bool(requires_recorder) and not self._can_use_recorder_features():
+            self.status_label.setText('Статус: TrendRecorder не запущен. Сначала запустите TrendRecorder.exe')
+            return
         window.show()
         window.raise_()
         window.activateWindow()
@@ -1830,70 +2416,48 @@ class MainWindow(QMainWindow):
             return True
         except Exception as exc:
             if not silent:
-                self.status_label.setText(f"Ошибка сохранения конфигурации регистратора: {exc}")
+                self.status_label.setText(f"РћС€РёР±РєР° СЃРѕС…СЂР°РЅРµРЅРёСЏ РєРѕРЅС„РёРіСѓСЂР°С†РёРё СЂРµРіРёСЃС‚СЂР°С‚РѕСЂР°: {exc}")
             return False
 
     def _external_recorder_command(self) -> list[str]:
         if getattr(sys, "frozen", False):
-            return [sys.executable, "--recorder"]
+            exe_path = Path(sys.executable).resolve()
+            recorder_candidate = exe_path.with_name("TrendRecorder.exe")
+            if recorder_candidate.exists():
+                return [str(recorder_candidate), "--recorder"]
+            # Fallback for one-binary recorder app.
+            if exe_path.name.lower() == "trendrecorder.exe":
+                return [str(exe_path), "--recorder"]
+            raise RuntimeError(
+                'Не найден TrendRecorder.exe рядом с клиентом. '
+                'Положите TrendClient.exe и TrendRecorder.exe в одну папку.'
+            )
         main_path = Path(__file__).resolve().parents[1] / "main.py"
         return [sys.executable, str(main_path), "--recorder"]
 
     def _start_external_recorder(self, _checked: bool = False) -> None:
-        self._store_ui_to_profile(self.current_profile)
-        if not self._save_recorder_config_snapshot(silent=False):
-            return
+        self.status_label.setText("Статус: автозапуск отключен. Запустите TrendRecorder.exe вручную и повторите подключение")
+        self._update_recorder_dependent_ui_state()
 
-        pid = read_recorder_pid()
-        if is_pid_running(pid):
-            self.status_label.setText(f"Статус: внешний регистратор уже запущен (PID {pid})")
-            return
-
-        cmd = self._external_recorder_command()
-        kwargs: dict[str, object] = {
-            "cwd": str(Path.cwd()),
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        if sys.platform == "win32":
-            kwargs["creationflags"] = (
-                getattr(subprocess, "DETACHED_PROCESS", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-
-        try:
-            subprocess.Popen(cmd, **kwargs)
-        except Exception as exc:
-            self.status_label.setText(f"Ошибка запуска внешнего регистратора: {exc}")
-            return
-
-        time.sleep(0.6)
-        pid = read_recorder_pid()
-        if is_pid_running(pid):
-            self.status_label.setText(f"Статус: внешний регистратор запущен (PID {pid})")
-        else:
-            self.status_label.setText("Статус: запуск регистратора выполнен, ожидание статуса")
 
     def _stop_external_recorder(self, _checked: bool = False) -> None:
-        pid = read_recorder_pid()
-        if not is_pid_running(pid):
+        pid = resolve_recorder_pid()
+        if pid is None:
             clear_recorder_pid()
-            self.status_label.setText("Статус: внешний регистратор не запущен")
+            self.status_label.setText('Статус: внешний регистратор не запущен')
             return
 
         try:
             request_recorder_stop()
         except Exception as exc:
-            self.status_label.setText(f"Ошибка отправки команды остановки: {exc}")
+            self.status_label.setText(f"РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё РєРѕРјР°РЅРґС‹ РѕСЃС‚Р°РЅРѕРІРєРё: {exc}")
             return
 
         deadline = time.monotonic() + 6.0
         while time.monotonic() < deadline:
-            if not is_pid_running(pid):
+            if resolve_recorder_pid() is None:
                 clear_recorder_pid()
-                self.status_label.setText("Статус: внешний регистратор остановлен")
+                self.status_label.setText('Статус: внешний регистратор остановлен')
                 return
             time.sleep(0.2)
 
@@ -1903,25 +2467,25 @@ class MainWindow(QMainWindow):
             else:
                 os.kill(int(pid), signal.SIGTERM)
         except Exception as exc:
-            self.status_label.setText(f"Ошибка принудительной остановки регистратора: {exc}")
+            self.status_label.setText(f"РћС€РёР±РєР° РїСЂРёРЅСѓРґРёС‚РµР»СЊРЅРѕР№ РѕСЃС‚Р°РЅРѕРІРєРё СЂРµРіРёСЃС‚СЂР°С‚РѕСЂР°: {exc}")
             return
 
         clear_recorder_pid()
-        self.status_label.setText("Статус: внешний регистратор принудительно остановлен")
+        self.status_label.setText('Статус: внешний регистратор принудительно остановлен')
 
     def _show_external_recorder_status(self, _checked: bool = False) -> None:
         payload = read_recorder_status() or {}
         if not payload:
             payload = {
                 "state": "unknown",
-                "message": "статус регистратора недоступен",
+                "message": 'статус регистратора недоступен',
                 "status_path": str(RECORDER_STATUS_PATH),
                 "config_path": str(RECORDER_CONFIG_PATH),
                 "pid_path": str(RECORDER_PID_PATH),
             }
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Статус внешнего регистратора")
+        dialog.setWindowTitle('Статус внешнего регистратора')
         dialog.resize(860, 560)
         layout = QVBoxLayout(dialog)
         edit = QPlainTextEdit()
@@ -1979,7 +2543,7 @@ class MainWindow(QMainWindow):
 
         self._values_collapsed = bool(collapsed)
         self.values_table.setVisible(not self._values_collapsed)
-        self.values_collapse_btn.setText("▸" if self._values_collapsed else "—")
+        self.values_collapse_btn.setText("в–ё" if self._values_collapsed else '—')
         self._apply_values_panel_layout()
         self._sync_values_panel_action()
         self._mark_config_dirty()
@@ -2002,7 +2566,7 @@ class MainWindow(QMainWindow):
         self.values_panel.setVisible(True)
         self._values_collapsed = False
         self.values_table.setVisible(True)
-        self.values_collapse_btn.setText("—")
+        self.values_collapse_btn.setText('—')
         self._apply_values_panel_layout()
         self._sync_values_panel_action()
         self._mark_config_dirty()
@@ -2089,7 +2653,7 @@ class MainWindow(QMainWindow):
         if ok:
             return
         if not silent:
-            self.status_label.setText(f"Ошибка автозапуска: {error}")
+            self.status_label.setText(f"РћС€РёР±РєР° Р°РІС‚РѕР·Р°РїСѓСЃРєР°: {error}")
 
     def _on_action_windows_autostart_toggled(self, checked: bool) -> None:
         enabled = bool(checked)
@@ -2098,15 +2662,15 @@ class MainWindow(QMainWindow):
         if not ok:
             self.app_config.auto_start_windows = False
             self._sync_startup_actions()
-            self.status_label.setText(f"Ошибка автозапуска: {error}")
+            self.status_label.setText(f"РћС€РёР±РєР° Р°РІС‚РѕР·Р°РїСѓСЃРєР°: {error}")
             return
         self.config_store.save(self.app_config)
-        self.status_label.setText("Статус: автозапуск обновлен")
+        self.status_label.setText('Статус: автозапуск обновлен')
 
     def _on_action_auto_connect_startup_toggled(self, checked: bool) -> None:
         self.app_config.auto_connect_on_launch = bool(checked)
         self.config_store.save(self.app_config)
-        self.status_label.setText("Статус: автостарт просмотра обновлен")
+        self.status_label.setText('Статус: автостарт просмотра обновлен')
 
     def _auto_connect_startup_if_needed(self) -> None:
         if not bool(self.app_config.auto_connect_on_launch):
@@ -2123,7 +2687,7 @@ class MainWindow(QMainWindow):
         text = json.dumps(payload, ensure_ascii=False, indent=2)
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Текущее ui_state")
+        dialog.setWindowTitle('Текущее ui_state')
         dialog.resize(900, 640)
         layout = QVBoxLayout(dialog)
         edit = QPlainTextEdit()
@@ -2147,14 +2711,14 @@ class MainWindow(QMainWindow):
             self._tray_icon.setIcon(icon)
 
         tray_menu = QMenu()
-        action_open = tray_menu.addAction("Открыть")
+        action_open = tray_menu.addAction('Открыть')
         action_open.triggered.connect(self._restore_from_tray)
-        action_start = tray_menu.addAction("Старт просмотра")
+        action_start = tray_menu.addAction('Старт просмотра')
         action_start.triggered.connect(self._start_worker)
-        action_stop = tray_menu.addAction("Стоп просмотра")
+        action_stop = tray_menu.addAction('Стоп просмотра')
         action_stop.triggered.connect(self._stop_worker)
         tray_menu.addSeparator()
-        action_exit = tray_menu.addAction("Выход")
+        action_exit = tray_menu.addAction('Выход')
         action_exit.triggered.connect(self._exit_from_tray)
 
         self._tray_icon.setContextMenu(tray_menu)
@@ -2170,7 +2734,7 @@ class MainWindow(QMainWindow):
         self.hide()
         self._tray_icon.showMessage(
             APP_NAME,
-            "Приложение свернуто в трей",
+            'Приложение свернуто в трей',
             QSystemTrayIcon.MessageIcon.Information,
             1500,
         )
@@ -2272,6 +2836,7 @@ class MainWindow(QMainWindow):
         put_size("main_window", self)
         put_size("connection_window", self.connection_window)
         put_size("signals_window", self.signals_window)
+        put_size("sources_window", self.sources_window)
         put_size("tags_window", self.tags_window)
         put_size("scales_window", self.scales_window)
         put_size("graph_settings_window", self.graph_settings_window)
@@ -2305,6 +2870,7 @@ class MainWindow(QMainWindow):
         apply_size("main_window", self, min_w=700, min_h=420)
         apply_size("connection_window", self.connection_window)
         apply_size("signals_window", self.signals_window)
+        apply_size("sources_window", self.sources_window)
         apply_size("tags_window", self.tags_window)
         apply_size("scales_window", self.scales_window)
         apply_size("graph_settings_window", self.graph_settings_window)
@@ -2454,6 +3020,10 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setValue(profile.timeout_s)
         self.retries_spin.setValue(profile.retries)
         self.address_offset_spin.setValue(profile.address_offset)
+        self.recorder_api_enabled_checkbox.setChecked(bool(profile.recorder_api_enabled))
+        self.recorder_api_host_edit.setText(str(profile.recorder_api_host or "0.0.0.0"))
+        self.recorder_api_port_spin.setValue(max(1, min(65535, int(profile.recorder_api_port))))
+        self.recorder_api_token_edit.setText(str(profile.recorder_api_token or ""))
         self._apply_render_interval_runtime(profile.render_interval_ms)
         mode_index = self.mode_combo.findData(profile.work_mode)
         self.mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
@@ -2461,6 +3031,7 @@ class MainWindow(QMainWindow):
         self.action_archive_write_db.setChecked(bool(profile.archive_to_db))
         self._load_graph_settings_to_ui(profile)
         self._fill_signal_table(profile.signals)
+        self._fill_sources_table(profile.recorder_sources)
         self._load_tags_to_ui(profile)
         self._apply_ui_state(profile)
         self._updating_ui = False
@@ -2485,6 +3056,7 @@ class MainWindow(QMainWindow):
         ):
             auto_x_enabled = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True
             self._load_recent_online_history_from_db(adjust_x_range=auto_x_enabled, silent=True)
+        self._update_recorder_dependent_ui_state()
 
     @staticmethod
     def _apply_color_button_style(button: QPushButton, color: str) -> None:
@@ -2522,10 +3094,10 @@ class MainWindow(QMainWindow):
     def _pick_graph_color(self, target: str) -> None:
         if target == "background":
             button = self.graph_bg_btn
-            title = "Выбор цвета фона графика"
+            title = 'Выбор цвета фона графика'
         else:
             button = self.graph_grid_color_btn
-            title = "Выбор цвета сетки"
+            title = 'Выбор цвета сетки'
         current = QColor(str(button.property("color_hex") or "#000000"))
         chosen = QColorDialog.getColor(current, self, title)
         if not chosen.isValid():
@@ -2648,7 +3220,7 @@ class MainWindow(QMainWindow):
         if not isinstance(button, QPushButton):
             return
         current = QColor(str(button.property("color_hex") or "#1f77b4"))
-        chosen = QColorDialog.getColor(current, self, "Выбор цвета сигнала")
+        chosen = QColorDialog.getColor(current, self, 'Выбор цвета сигнала')
         if not chosen.isValid():
             return
         color = chosen.name()
@@ -2697,6 +3269,10 @@ class MainWindow(QMainWindow):
         profile.timeout_s = float(self.timeout_spin.value())
         profile.retries = self.retries_spin.value()
         profile.address_offset = self.address_offset_spin.value()
+        profile.recorder_api_enabled = bool(self.recorder_api_enabled_checkbox.isChecked())
+        profile.recorder_api_host = self.recorder_api_host_edit.text().strip() or "0.0.0.0"
+        profile.recorder_api_port = int(self.recorder_api_port_spin.value())
+        profile.recorder_api_token = self.recorder_api_token_edit.text().strip()
         profile.plot_background_color = str(self.graph_bg_btn.property("color_hex") or profile.plot_background_color)
         profile.plot_grid_color = str(self.graph_grid_color_btn.property("color_hex") or profile.plot_grid_color)
         profile.plot_grid_alpha = max(0, min(100, int(self.graph_grid_alpha_spin.value())))
@@ -2712,6 +3288,7 @@ class MainWindow(QMainWindow):
         if not profile.db_path:
             profile.db_path = str(DEFAULT_DB_PATH)
         profile.signals = self._collect_signal_table(ensure_signal_minimum=ensure_signal_minimum)
+        profile.recorder_sources = self._collect_sources_table()
         profile.tag_tabs = self._collect_tags_tabs()
         profile.tags = self._clone_tag_list(profile.tag_tabs[0].tags) if profile.tag_tabs else []
         self._capture_ui_state(profile)
@@ -2733,6 +3310,10 @@ class MainWindow(QMainWindow):
             "timeout_s": float(profile.timeout_s),
             "retries": int(profile.retries),
             "address_offset": int(profile.address_offset),
+            "recorder_api_enabled": bool(profile.recorder_api_enabled),
+            "recorder_api_host": str(profile.recorder_api_host or "0.0.0.0"),
+            "recorder_api_port": int(profile.recorder_api_port),
+            "recorder_api_token": str(profile.recorder_api_token or ""),
             "db_path": str(profile.db_path or str(DEFAULT_DB_PATH)),
         }
 
@@ -2799,6 +3380,10 @@ class MainWindow(QMainWindow):
         profile.timeout_s = float_or(profile.timeout_s, "timeout_s", minimum=0.1, maximum=30.0)
         profile.retries = int_or(profile.retries, "retries", minimum=0, maximum=10)
         profile.address_offset = int_or(profile.address_offset, "address_offset", minimum=-10, maximum=10)
+        profile.recorder_api_enabled = bool(payload.get("recorder_api_enabled", profile.recorder_api_enabled))
+        profile.recorder_api_host = str(payload.get("recorder_api_host", profile.recorder_api_host) or "0.0.0.0").strip() or "0.0.0.0"
+        profile.recorder_api_port = int_or(profile.recorder_api_port, "recorder_api_port", minimum=1, maximum=65535)
+        profile.recorder_api_token = str(payload.get("recorder_api_token", profile.recorder_api_token) or "")
         db_path = str(payload.get("db_path", profile.db_path)).strip()
         profile.db_path = db_path or str(DEFAULT_DB_PATH)
 
@@ -2820,6 +3405,10 @@ class MainWindow(QMainWindow):
         self.timeout_spin.setValue(profile.timeout_s)
         self.retries_spin.setValue(profile.retries)
         self.address_offset_spin.setValue(profile.address_offset)
+        self.recorder_api_enabled_checkbox.setChecked(bool(profile.recorder_api_enabled))
+        self.recorder_api_host_edit.setText(str(profile.recorder_api_host or "0.0.0.0"))
+        self.recorder_api_port_spin.setValue(max(1, min(65535, int(profile.recorder_api_port))))
+        self.recorder_api_token_edit.setText(str(profile.recorder_api_token or ""))
 
     def _save_connection_config_to_file(self) -> None:
         self._store_ui_to_profile(self.current_profile)
@@ -2827,7 +3416,7 @@ class MainWindow(QMainWindow):
         default_path = str(Path.cwd() / default_name)
         file_path, _selected = QFileDialog.getSaveFileName(
             self,
-            "Экспорт подключения",
+            'Экспорт подключения',
             default_path,
             "Connection config (*.json);;All files (*.*)",
         )
@@ -2843,14 +3432,14 @@ class MainWindow(QMainWindow):
         }
         try:
             atomic_write_text(Path(file_path), json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.status_label.setText(f"Статус: подключение экспортировано -> {file_path}")
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: РїРѕРґРєР»СЋС‡РµРЅРёРµ СЌРєСЃРїРѕСЂС‚РёСЂРѕРІР°РЅРѕ -> {file_path}")
         except Exception as exc:
-            self.status_label.setText(f"Ошибка экспорта подключения: {exc}")
+            self.status_label.setText(f"РћС€РёР±РєР° СЌРєСЃРїРѕСЂС‚Р° РїРѕРґРєР»СЋС‡РµРЅРёСЏ: {exc}")
 
     def _load_connection_config_from_file(self) -> None:
         file_path, _selected = QFileDialog.getOpenFileName(
             self,
-            "Импорт подключения",
+            'Импорт подключения',
             str(Path.cwd()),
             "Connection config (*.json);;All files (*.*)",
         )
@@ -2860,11 +3449,11 @@ class MainWindow(QMainWindow):
         try:
             payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
         except Exception as exc:
-            self.status_label.setText(f"Ошибка чтения подключения: {exc}")
+            self.status_label.setText(f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ РїРѕРґРєР»СЋС‡РµРЅРёСЏ: {exc}")
             return
 
         if not isinstance(payload, dict):
-            self.status_label.setText("Ошибка: неверный формат файла подключения")
+            self.status_label.setText('Ошибка: неверный формат файла подключения')
             return
         if str(payload.get("format", "")) == CONNECTION_CONFIG_FORMAT:
             config_payload = payload.get("connection_config")
@@ -2872,7 +3461,7 @@ class MainWindow(QMainWindow):
             config_payload = payload
 
         if not isinstance(config_payload, dict):
-            self.status_label.setText("Ошибка: в файле нет валидной конфигурации подключения")
+            self.status_label.setText('Ошибка: в файле нет валидной конфигурации подключения')
             return
 
         self._apply_connection_config_to_profile(self.current_profile, config_payload)
@@ -2882,13 +3471,13 @@ class MainWindow(QMainWindow):
         combo_index = self.profile_combo.currentIndex()
         if combo_index >= 0:
             self.profile_combo.setItemText(combo_index, self.current_profile.name)
-        self.status_label.setText(f"Статус: подключение импортировано <- {file_path}")
+        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: РїРѕРґРєР»СЋС‡РµРЅРёРµ РёРјРїРѕСЂС‚РёСЂРѕРІР°РЅРѕ <- {file_path}")
 
     def _on_clear_archive_db_clicked(self, _checked: bool = False) -> None:
         answer = QMessageBox.question(
             self,
-            "Подтверждение очистки архива",
-            "Вы уверены? Это удалит все данные архива из базы.",
+            'Подтверждение очистки архива',
+            'Вы уверены? Это удалит все данные архива из базы.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2902,7 +3491,7 @@ class MainWindow(QMainWindow):
 
         db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
         if not db_path.exists():
-            self.status_label.setText("Статус: архивная БД отсутствует, очищать нечего")
+            self.status_label.setText('Статус: архивная БД отсутствует, очищать нечего')
             if was_running and mode == "online":
                 self._start_worker()
             return
@@ -2929,7 +3518,7 @@ class MainWindow(QMainWindow):
             finally:
                 conn.close()
         except Exception as exc:
-            self.status_label.setText(f"Ошибка очистки БД: {exc}")
+            self.status_label.setText(f"РћС€РёР±РєР° РѕС‡РёСЃС‚РєРё Р‘Р”: {exc}")
             if was_running and mode == "online":
                 self._start_worker()
             return
@@ -2943,7 +3532,7 @@ class MainWindow(QMainWindow):
         self.chart.set_connection_events([])
         self.chart.clear_data()
         self._update_runtime_status_panel()
-        self.status_label.setText("Статус: архивная БД очищена")
+        self.status_label.setText('Статус: архивная БД очищена')
 
         if was_running and mode == "online":
             self._start_worker()
@@ -2971,7 +3560,7 @@ class MainWindow(QMainWindow):
         headers = [
             str(self.signal_table.horizontalHeaderItem(col).text())
             if self.signal_table.horizontalHeaderItem(col) is not None
-            else f"Колонка {col + 1}"
+            else f"РљРѕР»РѕРЅРєР° {col + 1}"
             for col in range(self.signal_table.columnCount())
         ]
         for col, title in enumerate(headers):
@@ -2982,7 +3571,7 @@ class MainWindow(QMainWindow):
             self._signal_column_actions[col] = action
 
         menu.addSeparator()
-        fit_action = menu.addAction("Подогнать ширину по содержимому")
+        fit_action = menu.addAction('Подогнать ширину по содержимому')
         fit_action.triggered.connect(lambda _checked=False: self._fit_signal_table_columns(initial=False))
         menu.exec(self.signal_columns_btn.mapToGlobal(self.signal_columns_btn.rect().bottomLeft()))
 
@@ -3005,24 +3594,26 @@ class MainWindow(QMainWindow):
         self.signal_table.setItem(row, 0, enabled_item)
 
         name_item = QTableWidgetItem(signal.name)
-        name_item.setData(Qt.ItemDataRole.UserRole, signal.id)
+        name_item.setData(ROLE_SIGNAL_ID, signal.id)
+        name_item.setData(ROLE_SIGNAL_SOURCE_ID, str(getattr(signal, "source_id", "local") or "local"))
+        name_item.setData(ROLE_SIGNAL_REMOTE_TAG_ID, str(getattr(signal, "remote_tag_id", "") or ""))
         self.signal_table.setItem(row, 1, name_item)
 
         addr_text = f"{signal.address}.{signal.bit_index}" if signal.data_type == "bool" else str(signal.address)
         self.signal_table.setItem(row, 2, QTableWidgetItem(addr_text))
 
         reg_combo = QComboBox()
-        reg_combo.addItem("Holding (хран.)", "holding")
-        reg_combo.addItem("Input (вход.)", "input")
+        reg_combo.addItem('Holding (хран.)', "holding")
+        reg_combo.addItem('Input (вход.)', "input")
         reg_idx = reg_combo.findData(signal.register_type)
         reg_combo.setCurrentIndex(reg_idx if reg_idx >= 0 else 0)
         self.signal_table.setCellWidget(row, 3, reg_combo)
 
         type_combo = QComboBox()
-        type_combo.addItem("INT16 (знак.)", "int16")
-        type_combo.addItem("UINT16 (без знака)", "uint16")
+        type_combo.addItem('INT16 (знак.)', "int16")
+        type_combo.addItem('UINT16 (без знака)', "uint16")
         type_combo.addItem("REAL / FLOAT32", "float32")
-        type_combo.addItem("BOOL (бит)", "bool")
+        type_combo.addItem('BOOL (бит)', "bool")
         type_idx = type_combo.findData(signal.data_type)
         type_combo.setCurrentIndex(type_idx if type_idx >= 0 else 0)
         self.signal_table.setCellWidget(row, 4, type_combo)
@@ -3033,7 +3624,7 @@ class MainWindow(QMainWindow):
         self.signal_table.setCellWidget(row, 5, bit_spin)
 
         order_combo = QComboBox()
-        order_combo.addItem("ABCD (обычный)", "ABCD")
+        order_combo.addItem('ABCD (обычный)', "ABCD")
         order_combo.addItem("BADC (swap bytes)", "BADC")
         order_combo.addItem("CDAB (swap words)", "CDAB")
         order_combo.addItem("DCBA (reverse)", "DCBA")
@@ -3104,7 +3695,7 @@ class MainWindow(QMainWindow):
         self._fit_signal_table_columns(initial=False)
         self._apply_current_profile()
         self.status_label.setText(
-            f"Статус: добавлено {count} сигналов (старт={start_address}, шаг={step}, тип={data_type})"
+            f"РЎС‚Р°С‚СѓСЃ: РґРѕР±Р°РІР»РµРЅРѕ {count} СЃРёРіРЅР°Р»РѕРІ (СЃС‚Р°СЂС‚={start_address}, С€Р°Рі={step}, С‚РёРї={data_type})"
         )
 
     def _on_signal_table_item_changed(self, item: QTableWidgetItem) -> None:
@@ -3114,11 +3705,11 @@ class MainWindow(QMainWindow):
         name_item = self.signal_table.item(row, 1)
         if name_item is None:
             return
-        signal_id = str(name_item.data(Qt.ItemDataRole.UserRole) or "")
+        signal_id = str(name_item.data(ROLE_SIGNAL_ID) or "")
         if not signal_id:
             return
 
-        # "Вкл" changed.
+        # "Р’РєР»" changed.
         if item.column() == 0:
             enabled = item.checkState() == Qt.CheckState.Checked
             self.chart.set_signal_enabled(signal_id, enabled)
@@ -3150,7 +3741,7 @@ class MainWindow(QMainWindow):
             name_item = self.signal_table.item(row, 1)
             if name_item is None:
                 continue
-            row_signal_id = str(name_item.data(Qt.ItemDataRole.UserRole) or "")
+            row_signal_id = str(name_item.data(ROLE_SIGNAL_ID) or "")
             if row_signal_id != signal_id:
                 continue
             enabled_item = self.signal_table.item(row, 0)
@@ -3166,7 +3757,7 @@ class MainWindow(QMainWindow):
             name_item = self.signal_table.item(row, 1)
             if name_item is None:
                 continue
-            row_signal_id = str(name_item.data(Qt.ItemDataRole.UserRole) or "")
+            row_signal_id = str(name_item.data(ROLE_SIGNAL_ID) or "")
             if row_signal_id != signal_id:
                 continue
             color_btn = self.signal_table.cellWidget(row, 9)
@@ -3185,7 +3776,7 @@ class MainWindow(QMainWindow):
 
     def _on_values_color_clicked(self, signal_id: str) -> None:
         current = QColor(self.chart.get_signal_color(signal_id))
-        chosen = QColorDialog.getColor(current, self, "Выбор цвета сигнала")
+        chosen = QColorDialog.getColor(current, self, 'Выбор цвета сигнала')
         if not chosen.isValid():
             return
         color = chosen.name()
@@ -3209,7 +3800,7 @@ class MainWindow(QMainWindow):
             source = signals[row]
             duplicated = SignalConfig.from_dict(source.to_dict())
             duplicated.id = str(uuid.uuid4())
-            duplicated.name = f"{source.name} (копия)"
+            duplicated.name = f"{source.name} (РєРѕРїРёСЏ)"
             self._add_signal_row(duplicated)
 
         self._fit_signal_table_columns(initial=False)
@@ -3231,7 +3822,7 @@ class MainWindow(QMainWindow):
             name_item = self.signal_table.item(row, 1)
             if name_item is None:
                 continue
-            signal_id = str(name_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            signal_id = str(name_item.data(ROLE_SIGNAL_ID) or "").strip()
             if signal_id:
                 signal_ids.add(signal_id)
         return signal_ids
@@ -3257,8 +3848,8 @@ class MainWindow(QMainWindow):
 
         answer = QMessageBox.question(
             self,
-            "Сигналы графика",
-            "Удалить все сигналы из таблицы и очистить их архивную историю?",
+            'Сигналы графика',
+            'Удалить все сигналы из таблицы и очистить их архивную историю?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -3290,10 +3881,10 @@ class MainWindow(QMainWindow):
 
         if cleanup_error is None:
             self.status_label.setText(
-                f"Статус: все сигналы удалены, очищено {removed_samples} точек и {removed_meta} записей метаданных"
+                f"РЎС‚Р°С‚СѓСЃ: РІСЃРµ СЃРёРіРЅР°Р»С‹ СѓРґР°Р»РµРЅС‹, РѕС‡РёС‰РµРЅРѕ {removed_samples} С‚РѕС‡РµРє Рё {removed_meta} Р·Р°РїРёСЃРµР№ РјРµС‚Р°РґР°РЅРЅС‹С…"
             )
         else:
-            self.status_label.setText(f"Статус: сигналы удалены, но очистка архива не выполнена: {cleanup_error}")
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: СЃРёРіРЅР°Р»С‹ СѓРґР°Р»РµРЅС‹, РЅРѕ РѕС‡РёСЃС‚РєР° Р°СЂС…РёРІР° РЅРµ РІС‹РїРѕР»РЅРµРЅР°: {cleanup_error}")
 
     def _collect_signal_table(self, ensure_signal_minimum: bool = False) -> list[SignalConfig]:
         signals: list[SignalConfig] = []
@@ -3321,12 +3912,14 @@ class MainWindow(QMainWindow):
                 continue
 
             name = (name_item.text().strip() if name_item else "") or f"Signal {row + 1}"
-            signal_id = str(name_item.data(Qt.ItemDataRole.UserRole) or uuid.uuid4()) if name_item else str(uuid.uuid4())
+            signal_id = str(name_item.data(ROLE_SIGNAL_ID) or uuid.uuid4()) if name_item else str(uuid.uuid4())
             if signal_id in seen_ids:
                 signal_id = str(uuid.uuid4())
                 if name_item is not None:
-                    name_item.setData(Qt.ItemDataRole.UserRole, signal_id)
+                    name_item.setData(ROLE_SIGNAL_ID, signal_id)
             seen_ids.add(signal_id)
+            source_id = str(name_item.data(ROLE_SIGNAL_SOURCE_ID) or "local") if name_item else "local"
+            remote_tag_id = str(name_item.data(ROLE_SIGNAL_REMOTE_TAG_ID) or "") if name_item else ""
 
             address_text = addr_item.text() if addr_item else "0"
             fallback_bit = int(bit_spin.value())
@@ -3362,6 +3955,8 @@ class MainWindow(QMainWindow):
                     unit="",
                     color=color,
                     enabled=enabled,
+                    source_id=source_id,
+                    remote_tag_id=remote_tag_id,
                 )
             )
 
@@ -3413,7 +4008,7 @@ class MainWindow(QMainWindow):
 
     def _delete_profile(self) -> None:
         if len(self.app_config.profiles) <= 1:
-            QMessageBox.warning(self, APP_NAME, "Нельзя удалить последний профиль")
+            QMessageBox.warning(self, APP_NAME, 'Нельзя удалить последний профиль')
             return
 
         target_id = self.current_profile.id
@@ -3450,9 +4045,9 @@ class MainWindow(QMainWindow):
 
         self._save_recorder_config_snapshot(silent=True)
         if mode == "online":
-            self.status_label.setText("Статус: настройки применены")
+            self.status_label.setText('Статус: настройки применены')
         else:
-            self.status_label.setText("Статус: офлайн настройки применены")
+            self.status_label.setText('Статус: офлайн настройки применены')
 
     def _save_config(self) -> None:
         # Save persists current UI/profile state without restarting or
@@ -3461,13 +4056,13 @@ class MainWindow(QMainWindow):
         self.app_config.active_profile_id = self.current_profile.id
         self.config_store.save(self.app_config)
         self._save_recorder_config_snapshot(silent=True)
-        self.status_label.setText("Статус: конфигурация сохранена")
+        self.status_label.setText('Статус: конфигурация сохранена')
 
     def _export_chart_image(self, _checked: bool = False) -> None:
         suggested = f"{self.current_profile.name}_chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Экспорт графика в изображение",
+            'Экспорт графика в изображение',
             suggested,
             "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp)",
         )
@@ -3487,15 +4082,15 @@ class MainWindow(QMainWindow):
         pixmap = self.chart.plot_widget.grab()
         ok = pixmap.save(str(path), fmt.upper())
         if ok:
-            self.status_label.setText(f"Статус: график экспортирован -> {path}")
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: РіСЂР°С„РёРє СЌРєСЃРїРѕСЂС‚РёСЂРѕРІР°РЅ -> {path}")
         else:
-            self.status_label.setText("Ошибка: не удалось сохранить изображение графика")
+            self.status_label.setText('Ошибка: не удалось сохранить изображение графика')
 
     def _export_chart_csv(self, _checked: bool = False) -> None:
         suggested = f"{self.current_profile.name}_chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Экспорт данных графика (CSV)",
+            'Экспорт данных графика (CSV)',
             suggested,
             "CSV (*.csv)",
         )
@@ -3506,7 +4101,7 @@ class MainWindow(QMainWindow):
         signals = payload.get("signals") if isinstance(payload, dict) else None
         samples = payload.get("samples") if isinstance(payload, dict) else None
         if not isinstance(signals, list) or not isinstance(samples, dict):
-            self.status_label.setText("Ошибка: нет данных для экспорта CSV")
+            self.status_label.setText('Ошибка: нет данных для экспорта CSV')
             return
 
         rows_written = 0
@@ -3555,7 +4150,7 @@ class MainWindow(QMainWindow):
                     )
                     rows_written += 1
 
-        self.status_label.setText(f"Статус: CSV экспортирован ({rows_written} строк) -> {file_path}")
+        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: CSV СЌРєСЃРїРѕСЂС‚РёСЂРѕРІР°РЅ ({rows_written} СЃС‚СЂРѕРє) -> {file_path}")
 
     def _print_chart(self, _checked: bool = False) -> None:
         options = self._open_print_options_dialog()
@@ -3566,7 +4161,7 @@ class MainWindow(QMainWindow):
         printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
         printer.setPageOrientation(QPageLayout.Orientation.Landscape)
         dialog = QPrintDialog(printer, self)
-        dialog.setWindowTitle("Печать графика")
+        dialog.setWindowTitle('Печать графика')
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -3605,7 +4200,7 @@ class MainWindow(QMainWindow):
         )
         if pixmap.isNull():
             painter.end()
-            self.status_label.setText("Ошибка: график недоступен для печати")
+            self.status_label.setText('Ошибка: график недоступен для печати')
             return
 
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -3628,7 +4223,7 @@ class MainWindow(QMainWindow):
                 )
 
         painter.end()
-        self.status_label.setText(f"Статус: график отправлен на печать (A4, альбомная), страниц: {pages_printed}")
+        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: РіСЂР°С„РёРє РѕС‚РїСЂР°РІР»РµРЅ РЅР° РїРµС‡Р°С‚СЊ (A4, Р°Р»СЊР±РѕРјРЅР°СЏ), СЃС‚СЂР°РЅРёС†: {pages_printed}")
 
     def _build_print_chart_pixmap(
         self,
@@ -3680,7 +4275,7 @@ class MainWindow(QMainWindow):
         print_chart.configure_signals(print_signals)
         print_chart.set_print_time_axis_mode(True)
         # For print X axis labels (date/time ticks) are self-explanatory.
-        # Axis title "Время" adds clutter and may overlap at large fonts.
+        # Axis title "Р’СЂРµРјСЏ" adds clutter and may overlap at large fonts.
         print_chart.plot_item.getAxis("bottom").setLabel("")
         # Draw a dedicated readable legend via QPainter on the print page.
         # Built-in legend depends on runtime theme and may be unreadable on white paper.
@@ -3742,7 +4337,7 @@ class MainWindow(QMainWindow):
             color = str(row.get("color") or "#1f77b4")
             items.append(
                 {
-                    "name": f"{name} (шкала {axis_index})",
+                    "name": f"{name} (С€РєР°Р»Р° {axis_index})",
                     "color": color,
                 }
             )
@@ -3821,38 +4416,38 @@ class MainWindow(QMainWindow):
 
     def _open_print_options_dialog(self) -> dict | None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("Параметры печати")
+        dialog.setWindowTitle('Параметры печати')
         dialog.setModal(True)
         layout = QVBoxLayout(dialog)
 
-        info = QLabel("Формат печати: A4, альбомная ориентация.")
+        info = QLabel('Формат печати: A4, альбомная ориентация.')
         layout.addWidget(info)
 
-        force_grid_checkbox = QCheckBox("Контрастная сетка для печати")
+        force_grid_checkbox = QCheckBox('Контрастная сетка для печати')
         force_grid_checkbox.setChecked(True)
         layout.addWidget(force_grid_checkbox)
 
         font_preset_combo = QComboBox()
-        font_preset_combo.addItem("Мелкий", "small")
-        font_preset_combo.addItem("Средний", "medium")
-        font_preset_combo.addItem("Крупный", "large")
+        font_preset_combo.addItem('Мелкий', "small")
+        font_preset_combo.addItem('Средний', "medium")
+        font_preset_combo.addItem('Крупный', "large")
         font_preset_combo.setCurrentIndex(1)
         font_row = QHBoxLayout()
-        font_row.addWidget(QLabel("Размер шрифта графика:"))
+        font_row.addWidget(QLabel('Размер шрифта графика:'))
         font_row.addWidget(font_preset_combo, 1)
         layout.addLayout(font_row)
 
-        stats_page_checkbox = QCheckBox("Добавить статистику на отдельной странице")
+        stats_page_checkbox = QCheckBox('Добавить статистику на отдельной странице')
         stats_page_checkbox.setChecked(False)
         layout.addWidget(stats_page_checkbox)
 
-        details_page_checkbox = QCheckBox("Подробная статистика (расширенная)")
+        details_page_checkbox = QCheckBox('Подробная статистика (расширенная)')
         details_page_checkbox.setChecked(False)
         details_page_checkbox.setEnabled(False)
         stats_page_checkbox.toggled.connect(details_page_checkbox.setEnabled)
         layout.addWidget(details_page_checkbox)
 
-        fixed_source_label = QLabel("Источник статистики: период видимой области графика")
+        fixed_source_label = QLabel('Источник статистики: период видимой области графика')
         layout.addWidget(fixed_source_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -3891,7 +4486,7 @@ class MainWindow(QMainWindow):
             return
 
         title = (
-            "Статистика (видимая область): "
+            'Статистика (видимая область): '
             f"{format_ts_ms(start_ts) if end_ts > start_ts else '-'}"
             f" .. {format_ts_ms(end_ts) if end_ts > start_ts else '-'}"
         )
@@ -3919,7 +4514,7 @@ class MainWindow(QMainWindow):
             painter.setFont(base_font)
             return
 
-        headers = ["Сигнал", "Мин", "Макс", "Среднее", "Скорость, ед/с", "Точек"]
+        headers = ['Сигнал', 'Мин', 'Макс', 'Среднее', 'Скорость, ед/с', 'Точек']
         fractions = [0.30, 0.13, 0.13, 0.14, 0.18, 0.12]
         x_positions: list[int] = [table_rect.left()]
         cursor_x = float(table_rect.left())
@@ -3933,7 +4528,7 @@ class MainWindow(QMainWindow):
 
         draw_rows = rows[:max_rows] if rows else []
         if not draw_rows:
-            draw_rows = [{"name": "Нет данных", "min": "-", "max": "-", "avg": "-", "speed": "-", "count": "-"}]
+            draw_rows = [{"name": 'Нет данных', "min": "-", "max": "-", "avg": "-", "speed": "-", "count": "-"}]
         elif len(rows) > max_rows:
             draw_rows = rows[: max_rows - 1]
             draw_rows.append({"name": "...", "min": "...", "max": "...", "avg": "...", "speed": "...", "count": "..."})
@@ -4009,7 +4604,7 @@ class MainWindow(QMainWindow):
         page_font.setPointSizeF(max(10.5, point_size + 1.5))
         painter.setFont(page_font)
         fm = painter.fontMetrics()
-        text = "Стр. 999"
+        text = 'Стр. 999'
         text_w = fm.horizontalAdvance(text)
         box_w = text_w + 18
         box_h = max(24, int(fm.height() * 1.5))
@@ -4025,7 +4620,7 @@ class MainWindow(QMainWindow):
         page_font.setPointSizeF(max(10.5, point_size + 1.5))
         painter.setFont(page_font)
         fm = painter.fontMetrics()
-        text = f"Стр. {int(page_number)}"
+        text = f"РЎС‚СЂ. {int(page_number)}"
         text_w = fm.horizontalAdvance(text)
         box_w = text_w + 18
         box_h = max(24, int(fm.height() * 1.5))
@@ -4053,7 +4648,7 @@ class MainWindow(QMainWindow):
         if not source_rows:
             source_rows = [
                 {
-                    "name": "Нет данных",
+                    "name": 'Нет данных',
                     "min": None,
                     "max": None,
                     "avg": None,
@@ -4087,10 +4682,10 @@ class MainWindow(QMainWindow):
             painter.drawText(
                 QRect(content_rect.left(), content_rect.top(), content_rect.width(), title_h),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                "Подробная статистика (видимая область)" if detailed else "Статистика (видимая область)",
+                'Подробная статистика (видимая область)' if detailed else 'Статистика (видимая область)',
             )
             period_text = (
-                f"Период: {format_ts_ms(start_ts) if end_ts > start_ts else '-'}"
+                f"РџРµСЂРёРѕРґ: {format_ts_ms(start_ts) if end_ts > start_ts else '-'}"
                 f" .. {format_ts_ms(end_ts) if end_ts > start_ts else '-'}"
             )
             painter.drawText(
@@ -4106,10 +4701,10 @@ class MainWindow(QMainWindow):
                 break
 
             if detailed:
-                headers = ["Сигнал", "Мин", "Макс", "Среднее", "Размах", "Δ", "Скорость, ед/с", "Точек", "Интервал, с"]
+                headers = ['Сигнал', 'Мин', 'Макс', 'Среднее', 'Размах', 'Δ', 'Скорость, ед/с', 'Точек', 'Интервал, с']
                 fractions = [0.21, 0.09, 0.09, 0.10, 0.10, 0.10, 0.11, 0.08, 0.12]
             else:
-                headers = ["Сигнал", "Мин", "Макс", "Среднее", "Скорость, ед/с", "Точек"]
+                headers = ['Сигнал', 'Мин', 'Макс', 'Среднее', 'Скорость, ед/с', 'Точек']
                 fractions = [0.34, 0.13, 0.13, 0.16, 0.14, 0.10]
             x_positions: list[int] = [table_rect.left()]
             cursor_x = float(table_rect.left())
@@ -4233,6 +4828,12 @@ class MainWindow(QMainWindow):
             if mode == "online":
                 auto_x_enabled = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True
                 self._load_recent_online_history_from_db(adjust_x_range=auto_x_enabled, silent=True)
+                try:
+                    x_left, x_right = self.chart.current_x_range()
+                    span_s = max(10.0, float(x_right - x_left))
+                except Exception:
+                    span_s = 120.0
+                self._load_recent_remote_history_from_sources(span_s)
             if self._is_live_stream_running():
                 if not self._render_timer.isActive():
                     self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
@@ -4275,12 +4876,13 @@ class MainWindow(QMainWindow):
 
         if online_mode:
             if not self._is_live_stream_running():
-                self.status_label.setText("Статус: онлайн режим, ожидание запуска просмотра")
+                self.status_label.setText('Статус: онлайн режим, ожидание запуска просмотра')
             else:
-                self.status_label.setText("Статус: онлайн режим, просмотр из БД запущен")
+                self.status_label.setText('Статус: онлайн режим, просмотр из БД запущен')
         else:
-            self.status_label.setText("Статус: офлайн режим (архив)")
+            self.status_label.setText('Статус: офлайн режим (архив)')
         self._update_runtime_status_panel()
+        self._update_recorder_dependent_ui_state()
 
     @staticmethod
     def _archive_safe_ts(ts: float | None) -> str:
@@ -4595,32 +5197,32 @@ class MainWindow(QMainWindow):
             with zipfile.ZipFile(zip_path, mode="r") as bundle:
                 names = set(bundle.namelist())
                 if ARCHIVE_BUNDLE_MANIFEST not in names:
-                    return None, None, "Ошибка: этот ZIP не является архивом Trend Analyzer (нет манифеста)"
+                    return None, None, 'Ошибка: этот ZIP не является архивом Trend Analyzer (нет манифеста)'
 
                 try:
                     manifest_raw = bundle.read(ARCHIVE_BUNDLE_MANIFEST).decode("utf-8")
                     manifest = json.loads(manifest_raw)
                 except Exception as exc:
-                    return None, None, f"Ошибка чтения манифеста архива: {exc}"
+                    return None, None, f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ РјР°РЅРёС„РµСЃС‚Р° Р°СЂС…РёРІР°: {exc}"
 
                 if not isinstance(manifest, dict):
-                    return None, None, "Ошибка: некорректный манифест архива"
+                    return None, None, 'Ошибка: некорректный манифест архива'
                 if str(manifest.get("format", "")) != ARCHIVE_BUNDLE_FORMAT:
-                    return None, None, "Ошибка: неизвестный формат ZIP-архива"
+                    return None, None, 'Ошибка: неизвестный формат ZIP-архива'
                 if str(manifest.get("bundle_id", "")) != ARCHIVE_BUNDLE_MAGIC:
-                    return None, None, "Ошибка: ZIP-архив не принадлежит Trend Analyzer"
+                    return None, None, 'Ошибка: ZIP-архив не принадлежит Trend Analyzer'
 
                 files_raw = manifest.get("files")
                 if not isinstance(files_raw, list) or not files_raw:
-                    return None, None, "Ошибка: в ZIP-архиве нет списка файлов данных"
+                    return None, None, 'Ошибка: в ZIP-архиве нет списка файлов данных'
 
                 data_files: list[str] = []
                 for item in files_raw:
                     file_name = str(item)
                     if not file_name.startswith(f"{ARCHIVE_BUNDLE_DIR}/"):
-                        return None, None, "Ошибка: неверный путь файла в манифесте архива"
+                        return None, None, 'Ошибка: неверный путь файла в манифесте архива'
                     if file_name not in names:
-                        return None, None, f"Ошибка: в ZIP отсутствует файл данных {file_name}"
+                        return None, None, f"РћС€РёР±РєР°: РІ ZIP РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚ С„Р°Р№Р» РґР°РЅРЅС‹С… {file_name}"
                     data_files.append(file_name)
 
                 payloads: list[dict] = []
@@ -4629,9 +5231,9 @@ class MainWindow(QMainWindow):
                         payload_raw = bundle.read(file_name).decode("utf-8")
                         payload = json.loads(payload_raw)
                     except Exception as exc:
-                        return None, None, f"Ошибка чтения файла {file_name}: {exc}"
+                        return None, None, f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ С„Р°Р№Р»Р° {file_name}: {exc}"
                     if not isinstance(payload, dict):
-                        return None, None, f"Ошибка: неверный формат файла {file_name}"
+                        return None, None, f"РћС€РёР±РєР°: РЅРµРІРµСЂРЅС‹Р№ С„РѕСЂРјР°С‚ С„Р°Р№Р»Р° {file_name}"
                     payloads.append(payload)
 
                 connection_config: dict | None = None
@@ -4647,9 +5249,9 @@ class MainWindow(QMainWindow):
 
                 return payloads, connection_config, None
         except zipfile.BadZipFile:
-            return None, None, "Ошибка: поврежденный ZIP-архив"
+            return None, None, 'Ошибка: поврежденный ZIP-архив'
         except Exception as exc:
-            return None, None, f"Ошибка чтения ZIP-архива: {exc}"
+            return None, None, f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ ZIP-Р°СЂС…РёРІР°: {exc}"
 
     def _db_archive_range(self, db_path: Path, profile_id: str) -> tuple[float | None, float | None, int]:
         if not db_path.exists():
@@ -4752,12 +5354,12 @@ class MainWindow(QMainWindow):
         total_rows: int,
     ) -> tuple[float, float, int] | None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("Параметры экспорта архива")
+        dialog.setWindowTitle('Параметры экспорта архива')
         layout = QVBoxLayout(dialog)
 
         info_text = (
-            f"В базе найдено записей: {total_rows}\n"
-            f"Полный период: {self._archive_safe_ts(min_ts)} .. {self._archive_safe_ts(max_ts)}"
+            f"Р’ Р±Р°Р·Рµ РЅР°Р№РґРµРЅРѕ Р·Р°РїРёСЃРµР№: {total_rows}\n"
+            f"РџРѕР»РЅС‹Р№ РїРµСЂРёРѕРґ: {self._archive_safe_ts(min_ts)} .. {self._archive_safe_ts(max_ts)}"
         )
         info_label = QLabel(info_text)
         info_label.setWordWrap(True)
@@ -4778,14 +5380,14 @@ class MainWindow(QMainWindow):
         chunk_spin.setRange(1000, 2_000_000)
         chunk_spin.setSingleStep(1000)
         chunk_spin.setValue(200_000 if total_rows > 200_000 else max(10_000, total_rows))
-        chunk_spin.setSuffix(" строк/файл")
+        chunk_spin.setSuffix(' строк/файл')
 
-        form.addRow("Начало периода", start_edit)
-        form.addRow("Окончание периода", end_edit)
-        form.addRow("Разбиение", chunk_spin)
+        form.addRow('Начало периода', start_edit)
+        form.addRow('Окончание периода', end_edit)
+        form.addRow('Разбиение', chunk_spin)
         layout.addLayout(form)
 
-        hint_label = QLabel("Если строк больше заданного лимита, архив сохранится в несколько файлов *_partNNN.trend.json.")
+        hint_label = QLabel('Если строк больше заданного лимита, архив сохранится в несколько файлов *_partNNN.trend.json.')
         hint_label.setWordWrap(True)
         layout.addWidget(hint_label)
 
@@ -4796,7 +5398,7 @@ class MainWindow(QMainWindow):
             start_ts = start_edit.dateTime().toMSecsSinceEpoch() / 1000.0
             end_ts = end_edit.dateTime().toMSecsSinceEpoch() / 1000.0
             if end_ts < start_ts:
-                QMessageBox.warning(self, "Экспорт архива", "Окончание периода должно быть позже начала.")
+                QMessageBox.warning(self, 'Экспорт архива', 'Окончание периода должно быть позже начала.')
                 return
             dialog.accept()
 
@@ -4989,7 +5591,7 @@ class MainWindow(QMainWindow):
             default_path = str(Path.cwd() / default_name)
             file_path, selected_filter = QFileDialog.getSaveFileName(
                 self,
-                "Сохранить архив",
+                'Сохранить архив',
                 default_path,
                 "Trend bundle (*.trend.zip);;Trend archive (*.trend.json);;JSON (*.json)",
             )
@@ -5007,9 +5609,9 @@ class MainWindow(QMainWindow):
                         chunk_rows=max(1000, int(chunk_rows)),
                     )
                     if part_count <= 0:
-                        self.status_label.setText("Статус: нет данных за выбранный период")
+                        self.status_label.setText('Статус: нет данных за выбранный период')
                     else:
-                        self.status_label.setText(f"Статус: ZIP-архив сохранен ({part_count} частей) -> {out_path}")
+                        self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: ZIP-Р°СЂС…РёРІ СЃРѕС…СЂР°РЅРµРЅ ({part_count} С‡Р°СЃС‚РµР№) -> {out_path}")
                     return
 
                 out_path = self._archive_output_path(file_path)
@@ -5021,16 +5623,16 @@ class MainWindow(QMainWindow):
                     chunk_rows=max(1000, int(chunk_rows)),
                 )
             except Exception as exc:
-                self.status_label.setText(f"Ошибка сохранения архива: {exc}")
+                self.status_label.setText(f"РћС€РёР±РєР° СЃРѕС…СЂР°РЅРµРЅРёСЏ Р°СЂС…РёРІР°: {exc}")
                 return
 
             if not saved_parts:
-                self.status_label.setText("Статус: нет данных за выбранный период")
+                self.status_label.setText('Статус: нет данных за выбранный период')
             elif len(saved_parts) == 1:
-                self.status_label.setText(f"Статус: архив сохранен -> {saved_parts[0]}")
+                self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: Р°СЂС…РёРІ СЃРѕС…СЂР°РЅРµРЅ -> {saved_parts[0]}")
             else:
                 self.status_label.setText(
-                    f"Статус: архив сохранен ({len(saved_parts)} файлов) -> {saved_parts[0].parent}"
+                    f"РЎС‚Р°С‚СѓСЃ: Р°СЂС…РёРІ СЃРѕС…СЂР°РЅРµРЅ ({len(saved_parts)} С„Р°Р№Р»РѕРІ) -> {saved_parts[0].parent}"
                 )
             return
 
@@ -5038,7 +5640,7 @@ class MainWindow(QMainWindow):
         default_path = str(Path.cwd() / default_name)
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Сохранить архив",
+            'Сохранить архив',
             default_path,
             "Trend bundle (*.trend.zip);;Trend archive (*.trend.json);;JSON (*.json)",
         )
@@ -5057,19 +5659,19 @@ class MainWindow(QMainWindow):
             if export_zip:
                 out_path = self._archive_zip_output_path(file_path)
                 self._export_payload_to_zip(out_path, payload)
-                self.status_label.setText(f"Статус: ZIP-архив сохранен -> {out_path}")
+                self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: ZIP-Р°СЂС…РёРІ СЃРѕС…СЂР°РЅРµРЅ -> {out_path}")
                 return
 
             out_path = self._archive_output_path(file_path)
             atomic_write_text(out_path, json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.status_label.setText(f"Статус: архив сохранен -> {out_path}")
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: Р°СЂС…РёРІ СЃРѕС…СЂР°РЅРµРЅ -> {out_path}")
         except Exception as exc:
-            self.status_label.setText(f"Ошибка сохранения архива: {exc}")
+            self.status_label.setText(f"РћС€РёР±РєР° СЃРѕС…СЂР°РЅРµРЅРёСЏ Р°СЂС…РёРІР°: {exc}")
 
     def _load_archive_from_file(self) -> None:
         file_path, _selected = QFileDialog.getOpenFileName(
             self,
-            "Загрузить архив",
+            'Загрузить архив',
             str(Path.cwd()),
             "Trend bundle (*.trend.zip);;Trend archive (*.trend.json *.json);;All files (*.*)",
         )
@@ -5096,20 +5698,20 @@ class MainWindow(QMainWindow):
                 try:
                     payload = json.loads(part.read_text(encoding="utf-8"))
                 except Exception as exc:
-                    self.status_label.setText(f"Ошибка чтения архива ({part.name}): {exc}")
+                    self.status_label.setText(f"РћС€РёР±РєР° С‡С‚РµРЅРёСЏ Р°СЂС…РёРІР° ({part.name}): {exc}")
                     return
                 if not isinstance(payload, dict):
-                    self.status_label.setText(f"Ошибка: неверный формат файла архива ({part.name})")
+                    self.status_label.setText(f"РћС€РёР±РєР°: РЅРµРІРµСЂРЅС‹Р№ С„РѕСЂРјР°С‚ С„Р°Р№Р»Р° Р°СЂС…РёРІР° ({part.name})")
                     return
                 payloads.append(payload)
 
         if not payloads:
-            self.status_label.setText("Ошибка: архив пуст")
+            self.status_label.setText('Ошибка: архив пуст')
             return
 
         for payload in payloads:
             if not isinstance(payload, dict):
-                self.status_label.setText("Ошибка: неверный формат данных архива")
+                self.status_label.setText('Ошибка: неверный формат данных архива')
                 return
 
         loaded_signals_map: dict[str, SignalConfig] = {}
@@ -5160,7 +5762,7 @@ class MainWindow(QMainWindow):
                     loaded_connection_config = payload_config
 
         if not samples_map and not loaded_signals_map:
-            self.status_label.setText("Ошибка: в архиве нет валидных данных")
+            self.status_label.setText('Ошибка: в архиве нет валидных данных')
             return
 
         for bucket in samples_map.values():
@@ -5208,13 +5810,13 @@ class MainWindow(QMainWindow):
         self._apply_work_mode_ui("offline")
         if source_parts_count > 1:
             if source_type == "zip":
-                self.status_label.setText(f"Статус: ZIP-архив загружен ({source_parts_count} частей) <- {file_path}")
+                self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: ZIP-Р°СЂС…РёРІ Р·Р°РіСЂСѓР¶РµРЅ ({source_parts_count} С‡Р°СЃС‚РµР№) <- {file_path}")
             else:
-                self.status_label.setText(f"Статус: архив загружен ({source_parts_count} частей) <- {selected.name}")
+                self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: Р°СЂС…РёРІ Р·Р°РіСЂСѓР¶РµРЅ ({source_parts_count} С‡Р°СЃС‚РµР№) <- {selected.name}")
         elif source_type == "zip":
-            self.status_label.setText(f"Статус: ZIP-архив загружен <- {file_path}")
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: ZIP-Р°СЂС…РёРІ Р·Р°РіСЂСѓР¶РµРЅ <- {file_path}")
         else:
-            self.status_label.setText(f"Статус: архив загружен <- {file_path}")
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: Р°СЂС…РёРІ Р·Р°РіСЂСѓР¶РµРЅ <- {file_path}")
 
     def _load_recent_online_history_from_db(self, adjust_x_range: bool = True, silent: bool = True) -> bool:
         db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
@@ -5278,6 +5880,19 @@ class MainWindow(QMainWindow):
         if not samples_map:
             return False
 
+        signal_name_by_id = {str(item.id): str(item.name) for item in self.current_profile.signals if str(item.id)}
+        latest_values: dict[str, tuple[str, float]] = {}
+        for sid, points in samples_map.items():
+            if not points:
+                continue
+            try:
+                latest_val = float(points[-1][1])
+            except Exception:
+                continue
+            latest_values[str(sid)] = (signal_name_by_id.get(str(sid), str(sid)), latest_val)
+        if latest_values:
+            self._last_live_values.update(latest_values)
+
         gap_threshold = max(2.0, float(self.current_profile.poll_interval_ms) / 1000.0 * 2.5)
         worker_running = self._is_live_stream_running()
         runtime_connected = bool(self._runtime_connected)
@@ -5300,15 +5915,68 @@ class MainWindow(QMainWindow):
         if not silent:
             left_text = format_ts_ms(max(0.0, float(last_ts) - span))
             right_text = format_ts_ms(float(last_ts))
-            self.status_label.setText(f"Статус: восстановлена история из БД ({left_text} .. {right_text})")
+            self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: РІРѕСЃСЃС‚Р°РЅРѕРІР»РµРЅР° РёСЃС‚РѕСЂРёСЏ РёР· Р‘Р” ({left_text} .. {right_text})")
         return True
 
     def _is_live_stream_running(self) -> bool:
         return bool(self._db_live_running or (self._worker is not None and self._worker.isRunning()))
 
     def _is_external_recorder_running(self) -> bool:
-        pid = read_recorder_pid()
-        return is_pid_running(pid)
+        return resolve_recorder_pid() is not None
+
+    def _profile_uses_local_recorder(self) -> bool:
+        signals = list(getattr(self.current_profile, "signals", []) or [])
+        if not signals:
+            return True
+        for signal in signals:
+            source_id = str(getattr(signal, "source_id", "local") or "local")
+            if source_id == "local":
+                return True
+        return False
+
+    def _can_use_recorder_features(self) -> bool:
+        mode = str(getattr(self.current_profile, "work_mode", "online") or "online")
+        if mode != "online":
+            return True
+        if not self._profile_uses_local_recorder():
+            return True
+        return self._is_external_recorder_running()
+
+    def _update_recorder_dependent_ui_state(self) -> None:
+        enabled = self._can_use_recorder_features()
+        if self._recorder_controls_enabled is None or self._recorder_controls_enabled != enabled:
+            self._recorder_controls_enabled = enabled
+
+        for action_name in (
+            "action_connection",
+            "action_signals",
+            "action_sources",
+            "action_tags",
+            "action_scales",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(bool(enabled))
+
+        for window_name in (
+            "connection_window",
+            "signals_window",
+            "sources_window",
+            "tags_window",
+            "scales_window",
+        ):
+            win = getattr(self, window_name, None)
+            if win is not None:
+                win.setEnabled(bool(enabled))
+
+        mode = str(getattr(self.current_profile, "work_mode", "online") or "online")
+        online_mode = mode == "online"
+        can_start = online_mode and (not self._is_live_stream_running()) and bool(enabled)
+        can_stop = online_mode and self._is_live_stream_running()
+        if hasattr(self, "action_start"):
+            self.action_start.setEnabled(bool(can_start))
+        if hasattr(self, "action_stop"):
+            self.action_stop.setEnabled(bool(can_stop))
 
     def _close_db_live_connection(self) -> None:
         if self._db_live_conn is None:
@@ -5351,6 +6019,295 @@ class MainWindow(QMainWindow):
     def _bootstrap_db_live_cursors(self) -> None:
         self._db_live_last_sample_row_id = self._query_max_table_id("samples")
         self._db_live_last_connection_event_row_id = self._query_max_table_id("connection_events")
+        self._bootstrap_remote_live_cursors()
+
+    def _remote_signal_mapping(self) -> dict[str, dict[str, list[tuple[str, str]]]]:
+        mapping: dict[str, dict[str, list[tuple[str, str]]]] = {}
+        for signal in self.current_profile.signals:
+            source_id = str(getattr(signal, "source_id", "local") or "local")
+            remote_tag_id = str(getattr(signal, "remote_tag_id", "") or "")
+            if source_id == "local" or not remote_tag_id:
+                continue
+            mapping.setdefault(source_id, {}).setdefault(remote_tag_id, []).append((str(signal.id), str(signal.name)))
+        return mapping
+
+    def _bootstrap_remote_live_cursors(self) -> None:
+        self._remote_live_cursors = {}
+        self._remote_live_backoff_until_mono = {}
+        self._remote_live_fail_count = {}
+        self._remote_last_ok_mono = {}
+        for future in list(self._remote_live_futures.values()):
+            try:
+                future.cancel()
+            except Exception:
+                pass
+        self._remote_live_futures = {}
+        mapping = self._remote_signal_mapping()
+        if not mapping:
+            return
+        for source in self.current_profile.recorder_sources:
+            source_id = str(source.id)
+            if not source.enabled or source_id not in mapping:
+                continue
+            cursor = {"sample_id": 0, "event_id": 0}
+            try:
+                payload = self._source_request_json(
+                    source,
+                    "GET",
+                    "/v1/live",
+                    query={"bootstrap": 1},
+                    timeout_s=0.8,
+                )
+                if bool(payload.get("ok", False)):
+                    cursor["sample_id"] = int(payload.get("next_sample_id", 0) or 0)
+                    cursor["event_id"] = int(payload.get("next_event_id", 0) or 0)
+            except Exception:
+                pass
+            self._remote_live_cursors[source_id] = cursor
+
+    def _remote_live_timeout_s(self) -> float:
+        # Keep network waits short to avoid UI lag on temporary link issues.
+        try:
+            base = float(self.current_profile.timeout_s)
+        except Exception:
+            base = 1.0
+        return max(0.25, min(0.8, base * 0.5))
+
+    def _remote_live_fetch_payload(
+        self,
+        source: RecorderSourceConfig,
+        since_sample_id: int,
+        since_event_id: int,
+        timeout_s: float,
+    ) -> dict:
+        try:
+            payload = self._source_request_json(
+                source,
+                "GET",
+                "/v1/live",
+                query={
+                    "since_sample_id": int(since_sample_id),
+                    "since_event_id": int(since_event_id),
+                    "sample_limit": 4000,
+                    "event_limit": 2000,
+                },
+                timeout_s=float(timeout_s),
+            )
+            return {
+                "ok": True,
+                "payload": payload,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+            }
+
+    def _remote_connected_stable(self, mapped_source_ids: list[str], now_mono: float) -> bool:
+        if not mapped_source_ids:
+            return False
+        ttl_s = max(2.0, float(self._db_live_timer.interval()) / 1000.0 * 4.0)
+        for source_id in mapped_source_ids:
+            last_ok = self._remote_last_ok_mono.get(str(source_id))
+            if last_ok is not None and (now_mono - float(last_ok)) <= ttl_s:
+                return True
+        return False
+
+    def _append_remote_samples_rows(
+        self,
+        source: RecorderSourceConfig,
+        rows: list[dict],
+        tag_mapping: dict[str, list[tuple[str, str]]],
+    ) -> None:
+        if not rows:
+            return
+        batch: list[tuple[float, dict[str, tuple[str, float]]]] = []
+        current_ts: float | None = None
+        current_samples: dict[str, tuple[str, float]] = {}
+        for row in rows:
+            try:
+                remote_tag_id = str(row.get("tag_id") or "").strip()
+                ts_f = float(row.get("ts"))
+                value_f = float(row.get("value"))
+            except (TypeError, ValueError):
+                continue
+            targets = tag_mapping.get(remote_tag_id) or []
+            if not targets:
+                continue
+            if current_ts is None or abs(float(current_ts) - ts_f) > 1e-9:
+                if current_ts is not None and current_samples:
+                    batch.append((float(current_ts), current_samples))
+                current_ts = ts_f
+                current_samples = {}
+            for local_signal_id, local_signal_name in targets:
+                sid = str(local_signal_id)
+                sname = str(local_signal_name)
+                current_samples[sid] = (sname, value_f)
+                self._last_live_values[sid] = (sname, value_f)
+        if current_ts is not None and current_samples:
+            batch.append((float(current_ts), current_samples))
+        if not batch:
+            return
+        self._live_cycle_has_new_samples = True
+        if bool(self.current_profile.render_chart_enabled):
+            self._pending_render_samples.extend(batch)
+            if len(self._pending_render_samples) > self._max_pending_render_batches:
+                self._pending_render_samples = self._pending_render_samples[-self._max_pending_render_batches :]
+            if not self._render_timer.isActive():
+                self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
+                self._render_timer.start()
+
+    def _poll_remote_live_stream(self) -> bool:
+        mapping = self._remote_signal_mapping()
+        if not mapping:
+            self._remote_last_ok_mono = {}
+            self._remote_live_backoff_until_mono = {}
+            self._remote_live_fail_count = {}
+            for future in list(self._remote_live_futures.values()):
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+            self._remote_live_futures = {}
+            return False
+
+        by_id = {str(source.id): source for source in self.current_profile.recorder_sources if source.enabled}
+        # Cancel stale tasks for disabled/removed sources.
+        mapped_source_ids = {str(source_id) for source_id in mapping.keys()}
+        for source_id, future in list(self._remote_live_futures.items()):
+            if source_id in mapped_source_ids and source_id in by_id:
+                continue
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            self._remote_live_futures.pop(source_id, None)
+            self._remote_live_backoff_until_mono.pop(source_id, None)
+            self._remote_live_fail_count.pop(source_id, None)
+            self._remote_last_ok_mono.pop(source_id, None)
+
+        now_mono = time.monotonic()
+        any_ok_now = False
+
+        # 1) Consume completed requests (no blocking UI thread).
+        for source_id, future in list(self._remote_live_futures.items()):
+            if not future.done():
+                continue
+            self._remote_live_futures.pop(source_id, None)
+            source = by_id.get(source_id)
+            tags_map = mapping.get(source_id)
+            if source is None or tags_map is None:
+                continue
+            cursor = self._remote_live_cursors.setdefault(source_id, {"sample_id": 0, "event_id": 0})
+            result: dict
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+
+            payload = result.get("payload") if isinstance(result, dict) else None
+            request_ok = bool(isinstance(result, dict) and result.get("ok", False))
+            payload_ok = bool(isinstance(payload, dict) and payload.get("ok", False))
+
+            if request_ok and payload_ok:
+                any_ok_now = True
+                self._remote_last_ok_mono[source_id] = now_mono
+                self._remote_live_fail_count[source_id] = 0
+                self._remote_live_backoff_until_mono[source_id] = now_mono
+
+                sample_rows = payload.get("samples")
+                if isinstance(sample_rows, list):
+                    self._append_remote_samples_rows(source, sample_rows, tags_map)
+                try:
+                    cursor["sample_id"] = int(payload.get("next_sample_id", cursor.get("sample_id", 0)) or 0)
+                    cursor["event_id"] = int(payload.get("next_event_id", cursor.get("event_id", 0)) or 0)
+                except (TypeError, ValueError):
+                    pass
+                continue
+
+            fail_count = int(self._remote_live_fail_count.get(source_id, 0)) + 1
+            self._remote_live_fail_count[source_id] = fail_count
+            backoff_s = min(3.0, 0.25 * (2 ** max(0, fail_count - 1)))
+            self._remote_live_backoff_until_mono[source_id] = now_mono + backoff_s
+
+        # 2) Submit next requests only for sources that are due.
+        executor = self._remote_live_executor
+        if executor is not None:
+            timeout_s = self._remote_live_timeout_s()
+            for source_id, tags_map in mapping.items():
+                source = by_id.get(source_id)
+                if source is None:
+                    continue
+                if source_id in self._remote_live_futures:
+                    continue
+                due_at = float(self._remote_live_backoff_until_mono.get(source_id, 0.0))
+                if now_mono < due_at:
+                    continue
+                cursor = self._remote_live_cursors.setdefault(source_id, {"sample_id": 0, "event_id": 0})
+                source_copy = RecorderSourceConfig.from_dict(source.to_dict())
+                self._remote_live_futures[source_id] = executor.submit(
+                    self._remote_live_fetch_payload,
+                    source_copy,
+                    int(cursor.get("sample_id", 0)),
+                    int(cursor.get("event_id", 0)),
+                    float(timeout_s),
+                )
+
+        # Do not flap connectivity on transient failures.
+        return self._remote_connected_stable(list(mapped_source_ids), now_mono) or any_ok_now
+
+    def _load_recent_remote_history_from_sources(self, span_s: float) -> bool:
+        if span_s <= 0.0:
+            return False
+        mapping = self._remote_signal_mapping()
+        if not mapping:
+            return False
+        by_id = {str(source.id): source for source in self.current_profile.recorder_sources if source.enabled}
+        end_ts = time.time()
+        start_ts = max(0.0, end_ts - float(span_s))
+        loaded_any = False
+        for source_id, tags_map in mapping.items():
+            source = by_id.get(source_id)
+            if source is None:
+                continue
+            try:
+                payload = self._source_request_json(
+                    source,
+                    "GET",
+                    "/v1/history",
+                    query={
+                        "from_ts": f"{start_ts:.3f}",
+                        "to_ts": f"{end_ts:.3f}",
+                        "tag_ids": ",".join(tags_map.keys()),
+                    },
+                    timeout_s=max(0.6, min(1.2, self._remote_live_timeout_s() * 2.0)),
+                )
+            except Exception:
+                continue
+            if not bool(payload.get("ok", False)):
+                continue
+            samples_obj = payload.get("samples")
+            if not isinstance(samples_obj, dict):
+                continue
+            rows: list[dict] = []
+            for remote_tag_id, points in samples_obj.items():
+                if not isinstance(points, list):
+                    continue
+                for point in points:
+                    if not isinstance(point, (list, tuple)) or len(point) < 2:
+                        continue
+                    rows.append(
+                        {
+                            "tag_id": str(remote_tag_id),
+                            "ts": point[0],
+                            "value": point[1],
+                        }
+                    )
+            rows.sort(key=lambda item: float(item.get("ts", 0.0)))
+            if rows:
+                self._append_remote_samples_rows(source, rows, tags_map)
+                loaded_any = True
+        return loaded_any
 
     def _append_db_live_sample_rows(self, rows: list[tuple[int, str, float, float]]) -> None:
         if not rows:
@@ -5375,12 +6332,15 @@ class MainWindow(QMainWindow):
                     batch.append((float(current_ts), current_samples))
                 current_ts = ts_f
                 current_samples = {}
-            current_samples[sid] = (signal_name_by_id.get(sid, sid), value_f)
+            signal_name = signal_name_by_id.get(sid, sid)
+            current_samples[sid] = (signal_name, value_f)
+            self._last_live_values[sid] = (signal_name, value_f)
 
         if current_ts is not None and current_samples:
             batch.append((float(current_ts), current_samples))
         if not batch:
             return
+        self._live_cycle_has_new_samples = True
 
         if bool(self.current_profile.render_chart_enabled):
             self._pending_render_samples.extend(batch)
@@ -5409,67 +6369,91 @@ class MainWindow(QMainWindow):
                 self._last_connection_state = state_b
             self._runtime_connected = state_b
 
+    def _append_ui_heartbeat_if_needed(self, connected_now: bool) -> None:
+        if not connected_now:
+            return
+        if not bool(self.current_profile.render_chart_enabled):
+            return
+        if self._live_cycle_has_new_samples:
+            return
+        if not self._last_live_values:
+            return
+        now_ts = float(datetime.now().timestamp())
+        min_period_s = max(0.2, float(self.current_profile.render_interval_ms) / 1000.0)
+        if (now_ts - float(self._last_ui_heartbeat_ts)) < min_period_s:
+            return
+        self._pending_render_samples.append((now_ts, dict(self._last_live_values)))
+        if len(self._pending_render_samples) > self._max_pending_render_batches:
+            self._pending_render_samples = self._pending_render_samples[-self._max_pending_render_batches :]
+        if not self._render_timer.isActive():
+            self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
+            self._render_timer.start()
+        self._last_ui_heartbeat_ts = now_ts
+
     def _poll_db_live_stream(self) -> None:
         if not self._db_live_running:
             return
         if str(self.mode_combo.currentData() or "online") != "online":
             return
 
-        if not self._open_db_live_connection():
-            self._runtime_connected = False
-            self._update_runtime_status_panel()
-            return
+        self._live_cycle_has_new_samples = False
 
-        conn = self._db_live_conn
-        if conn is None:
-            self._runtime_connected = False
-            self._update_runtime_status_panel()
-            return
+        local_connected = False
+        if self._local_live_enabled:
+            conn = None
+            if self._open_db_live_connection():
+                conn = self._db_live_conn
 
-        try:
-            sample_rows = conn.execute(
-                """
-                SELECT id, signal_id, ts, value
-                FROM samples
-                WHERE profile_id = ? AND id > ?
-                ORDER BY id ASC
-                LIMIT 12000
-                """,
-                (self.current_profile.id, int(self._db_live_last_sample_row_id)),
-            ).fetchall()
-            if sample_rows:
-                self._db_live_last_sample_row_id = int(sample_rows[-1][0])
-                self._append_db_live_sample_rows(sample_rows)
-
-            connection_rows = conn.execute(
-                """
-                SELECT id, ts, is_connected
-                FROM connection_events
-                WHERE profile_id = ? AND id > ?
-                ORDER BY id ASC
-                LIMIT 4000
-                """,
-                (self.current_profile.id, int(self._db_live_last_connection_event_row_id)),
-            ).fetchall()
-            if connection_rows:
-                self._db_live_last_connection_event_row_id = int(connection_rows[-1][0])
-                self._append_db_live_connection_rows(connection_rows)
-        except Exception:
-            self._close_db_live_connection()
-            self._runtime_connected = False
-            self._update_runtime_status_panel()
-            return
-
-        if not self._is_external_recorder_running():
-            self._runtime_connected = False
-        else:
-            status_payload = read_recorder_status() or {}
-            if str(status_payload.get("profile_id") or "") == str(self.current_profile.id):
+            if conn is not None:
                 try:
-                    self._runtime_connected = bool(status_payload.get("connected", self._runtime_connected))
+                    sample_rows = conn.execute(
+                        """
+                        SELECT id, signal_id, ts, value
+                        FROM samples
+                        WHERE profile_id = ? AND id > ?
+                        ORDER BY id ASC
+                        LIMIT 12000
+                        """,
+                        (self.current_profile.id, int(self._db_live_last_sample_row_id)),
+                    ).fetchall()
+                    if sample_rows:
+                        self._db_live_last_sample_row_id = int(sample_rows[-1][0])
+                        self._append_db_live_sample_rows(sample_rows)
+
+                    connection_rows = conn.execute(
+                        """
+                        SELECT id, ts, is_connected
+                        FROM connection_events
+                        WHERE profile_id = ? AND id > ?
+                        ORDER BY id ASC
+                        LIMIT 4000
+                        """,
+                        (self.current_profile.id, int(self._db_live_last_connection_event_row_id)),
+                    ).fetchall()
+                    if connection_rows:
+                        self._db_live_last_connection_event_row_id = int(connection_rows[-1][0])
+                        self._append_db_live_connection_rows(connection_rows)
                 except Exception:
-                    pass
+                    self._close_db_live_connection()
+                    conn = None
+
+            if conn is not None:
+                if not self._is_external_recorder_running():
+                    local_connected = False
+                else:
+                    status_payload = read_recorder_status() or {}
+                    if str(status_payload.get("profile_id") or "") == str(self.current_profile.id):
+                        try:
+                            local_connected = bool(status_payload.get("connected", False))
+                        except Exception:
+                            local_connected = False
+
+        remote_connected = self._poll_remote_live_stream()
+        connected_now = bool(local_connected or remote_connected)
+        self._append_ui_heartbeat_if_needed(connected_now)
+        self._runtime_connected = connected_now
         self._update_runtime_status_panel()
+        self._update_recorder_dependent_ui_state()
 
     def _record_shutdown_disconnect_event(self) -> None:
         if self._archive_store is None:
@@ -5504,20 +6488,52 @@ class MainWindow(QMainWindow):
         if self._is_live_stream_running():
             return
 
-        if not self._is_external_recorder_running():
-            self._start_external_recorder()
-            if not self._is_external_recorder_running():
-                self.status_label.setText("Статус: не удалось запустить внешний регистратор")
+        self._last_live_values = {}
+        self._live_cycle_has_new_samples = False
+        self._last_ui_heartbeat_ts = 0.0
+
+        needs_local_stream = any(
+            str(getattr(signal, "source_id", "local") or "local") == "local" for signal in self.current_profile.signals
+        )
+        has_remote_stream = bool(self._remote_signal_mapping())
+        self._local_live_enabled = bool(needs_local_stream)
+
+        if self._local_live_enabled and not self._is_external_recorder_running():
+            if has_remote_stream:
+                self._local_live_enabled = False
+                self.status_label.setText('Статус: локальный TrendRecorder не запущен, запущен только удаленный live-поток')
+            else:
+                self.status_label.setText(
+                    'Ошибка: TrendRecorder не запущен. Сначала запустите TrendRecorder.exe, затем нажмите Старт'
+                )
+                self._update_recorder_dependent_ui_state()
                 return
 
-        self._close_db_live_connection()
-        if not self._open_db_live_connection():
-            self.status_label.setText("Ошибка: не удалось открыть архив БД для live-просмотра")
-            return
+        if self._local_live_enabled:
+            self._close_db_live_connection()
+            if self._local_live_enabled and not self._open_db_live_connection():
+                if has_remote_stream:
+                    self._local_live_enabled = False
+                    self.status_label.setText(
+                        'Статус: локальная БД недоступна, запущен только удаленный live-поток'
+                    )
+                else:
+                    self.status_label.setText('Ошибка: не удалось открыть архив БД для live-просмотра')
+                    return
+        else:
+            self._close_db_live_connection()
 
         restored = False
-        if bool(self.current_profile.render_chart_enabled):
+        if bool(self.current_profile.render_chart_enabled) and self._local_live_enabled:
             restored = self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
+            try:
+                x_left, x_right = self.chart.current_x_range()
+                span_s = max(10.0, float(x_right - x_left))
+            except Exception:
+                span_s = 120.0
+            self._load_recent_remote_history_from_sources(span_s)
+        elif bool(self.current_profile.render_chart_enabled):
+            self._load_recent_remote_history_from_sources(120.0)
         if not restored:
             self._connection_events = []
             self._last_connection_state = None
@@ -5540,12 +6556,27 @@ class MainWindow(QMainWindow):
         self.action_start.setEnabled(False)
         self.action_stop.setEnabled(True)
         self._poll_db_live_stream()
-        self.status_label.setText("Статус: просмотр из БД запущен")
+        self._update_recorder_dependent_ui_state()
+        self.status_label.setText('Статус: просмотр из БД запущен')
 
     def _stop_worker(self) -> None:
         if self._db_live_timer.isActive():
             self._db_live_timer.stop()
         self._db_live_running = False
+        self._local_live_enabled = True
+        self._remote_live_cursors = {}
+        self._last_live_values = {}
+        self._live_cycle_has_new_samples = False
+        self._last_ui_heartbeat_ts = 0.0
+        for future in list(self._remote_live_futures.values()):
+            try:
+                future.cancel()
+            except Exception:
+                pass
+        self._remote_live_futures = {}
+        self._remote_live_backoff_until_mono = {}
+        self._remote_live_fail_count = {}
+        self._remote_last_ok_mono = {}
         self._close_db_live_connection()
 
         if self._worker is not None:
@@ -5568,7 +6599,8 @@ class MainWindow(QMainWindow):
         self.action_stop.setEnabled(False)
         self._runtime_connected = False
         self._update_runtime_status_panel()
-        self.status_label.setText("Статус: остановлено")
+        self._update_recorder_dependent_ui_state()
+        self.status_label.setText('Статус: остановлено')
 
     def _on_connection_changed(self, is_connected: bool) -> None:
         self._runtime_connected = bool(is_connected)
@@ -5587,7 +6619,7 @@ class MainWindow(QMainWindow):
                     try:
                         self._archive_store.insert_connection_event(self.current_profile.id, ts, state)
                     except Exception as exc:
-                        self.status_label.setText(f"Ошибка архивации состояния связи: {exc}")
+                        self.status_label.setText(f"РћС€РёР±РєР° Р°СЂС…РёРІР°С†РёРё СЃРѕСЃС‚РѕСЏРЅРёСЏ СЃРІСЏР·Рё: {exc}")
             self._last_connection_state = state
 
         if self._is_live_stream_running():
@@ -5711,11 +6743,11 @@ class MainWindow(QMainWindow):
             y_min = float(min_item.text().replace(",", "."))
             y_max = float(max_item.text().replace(",", "."))
         except ValueError:
-            self.status_label.setText("Ошибка: Мин/Макс должны быть числами")
+            self.status_label.setText('Ошибка: Мин/Макс должны быть числами')
             return
 
         if y_max <= y_min:
-            self.status_label.setText("Ошибка: Макс должен быть больше Мин")
+            self.status_label.setText('Ошибка: Макс должен быть больше Мин')
             return
 
         self.chart.set_axis_range(axis_index, y_min, y_max)
@@ -5785,7 +6817,7 @@ class MainWindow(QMainWindow):
 
                 mode = str(row.get("mode", ""))
                 if not enabled:
-                    mode = f"{mode} (скрыт)".strip()
+                    mode = f"{mode} (СЃРєСЂС‹С‚)".strip()
                 mode_item = self.values_table.item(idx, 5)
                 if mode_item is None:
                     mode_item = QTableWidgetItem()
@@ -5808,7 +6840,7 @@ class MainWindow(QMainWindow):
             self._apply_saved_table_column_widths(self.current_profile, "values_table", self.values_table)
 
     def _on_worker_error(self, message: str) -> None:
-        self.status_label.setText(f"Ошибка: {message}")
+        self.status_label.setText(f"РћС€РёР±РєР°: {message}")
 
     def _prune_archive_retention_if_needed(self, ts: float) -> None:
         if self._archive_store is None:
@@ -5825,7 +6857,7 @@ class MainWindow(QMainWindow):
             self._archive_store.prune_older_than(self.current_profile.id, cutoff_ts)
             self._last_retention_cleanup_ts = float(ts)
         except Exception as exc:
-            self.status_label.setText(f"Ошибка очистки архива: {exc}")
+            self.status_label.setText(f"РћС€РёР±РєР° РѕС‡РёСЃС‚РєРё Р°СЂС…РёРІР°: {exc}")
 
     def _should_archive_signal_sample(self, signal_id: str, ts: float, value: float) -> bool:
         last_value = self._archive_last_values.get(signal_id)
@@ -5902,18 +6934,36 @@ class MainWindow(QMainWindow):
             return True
         answer = QMessageBox.question(
             self,
-            "Подтверждение закрытия",
-            "Сейчас идет запись архива. При закрытии приложения запись остановится.\nЗакрыть приложение?",
+            'Подтверждение закрытия',
+            'Сейчас идет запись архива. При закрытии приложения запись остановится.\nЗакрыть приложение?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         return answer == QMessageBox.StandardButton.Yes
+
+    def _shutdown_remote_live_executor(self) -> None:
+        for future in list(self._remote_live_futures.values()):
+            try:
+                future.cancel()
+            except Exception:
+                pass
+        self._remote_live_futures = {}
+        executor = self._remote_live_executor
+        self._remote_live_executor = None
+        if executor is not None:
+            try:
+                # Wait for worker threads to exit to avoid lingering handles in
+                # frozen one-file shutdown.
+                executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
 
     def closeEvent(self, event) -> None:
         if self._force_close:
             self._stop_tags_polling(silent=True)
             self._record_shutdown_disconnect_event()
             self._stop_worker()
+            self._shutdown_remote_live_executor()
             self._save_config()
             if self._tray_icon is not None:
                 self._tray_icon.hide()
@@ -5928,11 +6978,11 @@ class MainWindow(QMainWindow):
 
         if behavior == "ask":
             dialog = QMessageBox(self)
-            dialog.setWindowTitle("Закрытие приложения")
-            dialog.setText("Выберите действие при закрытии.")
-            tray_btn = dialog.addButton("В трей", QMessageBox.ButtonRole.ActionRole)
-            close_btn = dialog.addButton("Закрыть", QMessageBox.ButtonRole.AcceptRole)
-            cancel_btn = dialog.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+            dialog.setWindowTitle('Закрытие приложения')
+            dialog.setText('Выберите действие при закрытии.')
+            tray_btn = dialog.addButton('В трей', QMessageBox.ButtonRole.ActionRole)
+            close_btn = dialog.addButton('Закрыть', QMessageBox.ButtonRole.AcceptRole)
+            cancel_btn = dialog.addButton('Отмена', QMessageBox.ButtonRole.RejectRole)
             dialog.setDefaultButton(close_btn)
             dialog.exec()
             clicked = dialog.clickedButton()
@@ -5955,6 +7005,7 @@ class MainWindow(QMainWindow):
         self._stop_tags_polling(silent=True)
         self._record_shutdown_disconnect_event()
         self._stop_worker()
+        self._shutdown_remote_live_executor()
         self._save_config()
         if self._tray_icon is not None:
             self._tray_icon.hide()
@@ -5986,7 +7037,13 @@ def run_app() -> None:
         except Exception:
             pass
 
+    instance_lock = SingleInstanceLock("trend_client")
+    if not instance_lock.acquire():
+        show_already_running_message(APP_NAME, 'Клиент уже запущен. Разрешен только один экземпляр.')
+        return
+
     app = QApplication([])
+    app._instance_lock = instance_lock  # type: ignore[attr-defined]
     icon = None
     icon_path = _resolve_icon_path()
     if icon_path is not None:

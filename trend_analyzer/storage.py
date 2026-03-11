@@ -300,3 +300,22 @@ class ArchiveStore:
 
     def flush(self) -> None:
         self._commit_if_needed(force=True)
+
+    def min_sample_ts(self, profile_id: str) -> float | None:
+        row = self._conn.execute(
+            """
+            SELECT MIN(ts)
+            FROM samples
+            WHERE profile_id = ?
+            """,
+            (str(profile_id),),
+        ).fetchone()
+        if not row:
+            return None
+        value = row[0]
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None

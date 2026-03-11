@@ -22,6 +22,8 @@ class SignalConfig:
     unit: str = ""
     color: str = "#1f77b4"
     enabled: bool = True
+    source_id: str = "local"
+    remote_tag_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -37,6 +39,8 @@ class SignalConfig:
             "unit": self.unit,
             "color": self.color,
             "enabled": self.enabled,
+            "source_id": self.source_id,
+            "remote_tag_id": self.remote_tag_id,
         }
 
     @classmethod
@@ -54,6 +58,46 @@ class SignalConfig:
             unit=str(payload.get("unit") or ""),
             color=str(payload.get("color") or "#1f77b4"),
             enabled=bool(payload.get("enabled", True)),
+            source_id=str(payload.get("source_id") or "local"),
+            remote_tag_id=str(payload.get("remote_tag_id") or ""),
+        )
+
+
+@dataclass
+class RecorderSourceConfig:
+    id: str = field(default_factory=_uuid)
+    name: str = "Recorder"
+    host: str = "127.0.0.1"
+    port: int = 18777
+    token: str = ""
+    enabled: bool = True
+    recorder_id: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "host": self.host,
+            "port": self.port,
+            "token": self.token,
+            "enabled": self.enabled,
+            "recorder_id": self.recorder_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "RecorderSourceConfig":
+        try:
+            port = int(payload.get("port") or 18777)
+        except (TypeError, ValueError):
+            port = 18777
+        return cls(
+            id=str(payload.get("id") or _uuid()),
+            name=str(payload.get("name") or "Recorder"),
+            host=str(payload.get("host") or "127.0.0.1"),
+            port=max(1, min(65535, port)),
+            token=str(payload.get("token") or ""),
+            enabled=bool(payload.get("enabled", True)),
+            recorder_id=str(payload.get("recorder_id") or ""),
         )
 
 
@@ -153,10 +197,15 @@ class ProfileConfig:
     tags_bulk_data_type: str = "int16"
     tags_bulk_float_order: str = "ABCD"
     tags_poll_interval_ms: int = 1000
+    recorder_api_enabled: bool = True
+    recorder_api_host: str = "0.0.0.0"
+    recorder_api_port: int = 18777
+    recorder_api_token: str = ""
     db_path: str = ""
     signals: list[SignalConfig] = field(default_factory=list)
     tags: list[TagConfig] = field(default_factory=list)
     tag_tabs: list[TagTabConfig] = field(default_factory=lambda: [TagTabConfig(name="Вкладка 1", tags=[])])
+    recorder_sources: list[RecorderSourceConfig] = field(default_factory=list)
     ui_state: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -191,10 +240,15 @@ class ProfileConfig:
             "tags_bulk_data_type": self.tags_bulk_data_type,
             "tags_bulk_float_order": self.tags_bulk_float_order,
             "tags_poll_interval_ms": self.tags_poll_interval_ms,
+            "recorder_api_enabled": self.recorder_api_enabled,
+            "recorder_api_host": self.recorder_api_host,
+            "recorder_api_port": self.recorder_api_port,
+            "recorder_api_token": self.recorder_api_token,
             "db_path": self.db_path,
             "signals": [item.to_dict() for item in self.signals],
             "tags": [item.to_dict() for item in self.tags],
             "tag_tabs": [item.to_dict() for item in self.tag_tabs],
+            "recorder_sources": [item.to_dict() for item in self.recorder_sources],
             "ui_state": self.ui_state,
         }
 
@@ -206,6 +260,10 @@ class ProfileConfig:
         tags = [TagConfig.from_dict(item) for item in tags_raw]
         tag_tabs_raw = payload.get("tag_tabs") or []
         tag_tabs = [TagTabConfig.from_dict(item) for item in tag_tabs_raw if isinstance(item, dict)]
+        recorder_sources_raw = payload.get("recorder_sources") or []
+        recorder_sources = [
+            RecorderSourceConfig.from_dict(item) for item in recorder_sources_raw if isinstance(item, dict)
+        ]
         if not tag_tabs:
             tag_tabs = [TagTabConfig(name="Вкладка 1", tags=tags)]
         if not tag_tabs:
@@ -216,6 +274,10 @@ class ProfileConfig:
         work_mode = str(payload.get("work_mode") or "online")
         if work_mode not in {"online", "offline"}:
             work_mode = "online"
+        try:
+            recorder_api_port = int(payload.get("recorder_api_port") or 18777)
+        except (TypeError, ValueError):
+            recorder_api_port = 18777
 
         return cls(
             id=str(payload.get("id") or _uuid()),
@@ -248,10 +310,15 @@ class ProfileConfig:
             tags_bulk_data_type=str(payload.get("tags_bulk_data_type") or "int16"),
             tags_bulk_float_order=str(payload.get("tags_bulk_float_order") or "ABCD"),
             tags_poll_interval_ms=max(100, int(payload.get("tags_poll_interval_ms") or 1000)),
+            recorder_api_enabled=bool(payload.get("recorder_api_enabled", True)),
+            recorder_api_host=str(payload.get("recorder_api_host") or "0.0.0.0"),
+            recorder_api_port=max(1, min(65535, recorder_api_port)),
+            recorder_api_token=str(payload.get("recorder_api_token") or ""),
             db_path=str(payload.get("db_path") or ""),
             signals=signals,
             tags=legacy_tags,
             tag_tabs=tag_tabs,
+            recorder_sources=recorder_sources,
             ui_state=payload.get("ui_state") if isinstance(payload.get("ui_state"), dict) else {},
         )
 

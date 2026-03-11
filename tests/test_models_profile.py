@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from trend_analyzer.models import ProfileConfig
+from trend_analyzer.models import ProfileConfig, RecorderSourceConfig, SignalConfig
 
 
 class ProfileModelTests(unittest.TestCase):
@@ -37,6 +37,42 @@ class ProfileModelTests(unittest.TestCase):
     def test_explicit_empty_signals_are_preserved(self) -> None:
         restored = ProfileConfig.from_dict({"signals": []})
         self.assertEqual(restored.signals, [])
+
+    def test_remote_sources_and_signal_binding_serialization(self) -> None:
+        profile = ProfileConfig(
+            recorder_sources=[
+                RecorderSourceConfig(
+                    id="src-a",
+                    name="Recorder A",
+                    host="192.168.1.10",
+                    port=18777,
+                    token="tok",
+                    enabled=True,
+                    recorder_id="rec-a",
+                )
+            ],
+            signals=[
+                SignalConfig(
+                    id="sig-a",
+                    name="Remote Tag",
+                    source_id="src-a",
+                    remote_tag_id="tag-001",
+                )
+            ],
+            recorder_api_enabled=True,
+            recorder_api_host="0.0.0.0",
+            recorder_api_port=18777,
+            recorder_api_token="api-token",
+        )
+        restored = ProfileConfig.from_dict(profile.to_dict())
+        self.assertEqual(len(restored.recorder_sources), 1)
+        self.assertEqual(restored.recorder_sources[0].id, "src-a")
+        self.assertEqual(restored.recorder_sources[0].host, "192.168.1.10")
+        self.assertEqual(restored.signals[0].source_id, "src-a")
+        self.assertEqual(restored.signals[0].remote_tag_id, "tag-001")
+        self.assertTrue(restored.recorder_api_enabled)
+        self.assertEqual(restored.recorder_api_port, 18777)
+        self.assertEqual(restored.recorder_api_token, "api-token")
 
 
     def test_archive_change_only_fields_bounds(self) -> None:

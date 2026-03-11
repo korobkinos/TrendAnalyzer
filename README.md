@@ -1,4 +1,4 @@
-# Trend Analyzer v1.3.0
+# Trend Analyzer v1.5.2
 
 Приложение для онлайн/офлайн анализа технологических сигналов с Modbus TCP, архивом и печатью графиков.
 
@@ -14,6 +14,12 @@
 С версии `1.3.0` онлайн-режим работает по схеме единого источника:
 - `Recorder` опрашивает Modbus и пишет в БД,
 - UI в онлайн-режиме читает live-хвост данных из БД для графика и таблиц.
+
+С версии `1.4.0` добавлен мульти-источниковый режим:
+- `Recorder API v1` для удалённых клиентов,
+- окно `Источники данных` с ручным добавлением и авто-сканером сети,
+- импорт тегов из удалённых recorder в график,
+- чтение/запись регистров через выбранный удалённый recorder.
 
 ## Основные возможности
 
@@ -31,6 +37,9 @@
   - запуск/останов из UI,
   - отдельный статус регистратора,
   - запись продолжается без зависимости от окна графиков.
+- Recorder API (`HTTP`) для удалённых клиентов:
+  - `/v1/health`, `/v1/tags`, `/v1/live`, `/v1/history`, `/v1/config`,
+  - `/v1/modbus/read`, `/v1/modbus/write`.
 - Сборка portable EXE (one-file).
 
 ## Быстрый запуск (из исходников)
@@ -73,15 +82,16 @@ python main.py --recorder-tray
 - Команда управления регистратором: `~/.trend_analyzer/recorder_control.json`
 - PID внешнего регистратора: `~/.trend_analyzer/recorder.pid`
 
-Для portable EXE (`dist\TrendAnalyzer.exe`):
+Для portable EXE:
 
+- `dist\TrendClient.exe` и `dist\TrendRecorder.exe` в одной папке
 - `data\config.json` рядом с `exe`
 - `data\archive.db` рядом с `exe`
 - `data\recorder_config.json` рядом с `exe`
 - `data\recorder_status.json` рядом с `exe`
 - `data\recorder_control.json` рядом с `exe`
 
-## Сборка portable EXE
+## Сборка portable EXE (Windows)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_portable.ps1
@@ -89,7 +99,8 @@ powershell -ExecutionPolicy Bypass -File .\build_portable.ps1
 
 Результат:
 
-- `dist\TrendAnalyzer.exe`
+- `dist\TrendClient.exe`
+- `dist\TrendRecorder.exe` (tray + recorder core через ключ `--recorder`)
 
 ## Версионирование
 
@@ -103,3 +114,51 @@ powershell -ExecutionPolicy Bypass -File .\build_portable.ps1
 
 - см. `CHANGELOG.md`
 - см. `SESSION_HANDOFF_RU.md`
+
+## Separate recorder and client binaries (recommended)
+
+Now the project supports role-based startup and split builds:
+
+- `TrendClient` - UI client (charts, analysis, source management).
+- `TrendRecorder` - recorder for background archiving.  
+  On Windows it starts as tray app and can run recorder core (`--recorder`).
+
+### Build on Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_roles_windows.ps1
+```
+
+Output:
+- `dist\TrendClient.exe`
+- `dist\TrendRecorder.exe`
+
+### Build on Linux
+
+```bash
+chmod +x ./build_roles_linux.sh
+./build_roles_linux.sh
+```
+
+Output:
+- `dist/TrendClient`
+- `dist/TrendRecorder`
+
+### Build .deb packages on Linux (Debian/Ubuntu/Mint)
+
+```bash
+chmod +x ./build_deb_roles.sh
+./build_deb_roles.sh amd64
+```
+
+Output:
+- `dist/deb/trend-client_<version>_amd64.deb`
+- `dist/deb/trend-recorder_<version>_amd64.deb`
+
+### Headless deployment flow
+
+1. Install/start `TrendRecorder` on machine with PLC.
+2. From client machine open: `Настройка -> Дополнительно -> Источники данных...`.
+3. Add recorder manually (IP/port/token) or run subnet scan.
+4. Use `Применить профиль на источник` to push current profile to recorder.
+5. Recorder starts polling/writing archive using pushed config.

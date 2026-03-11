@@ -1,5 +1,91 @@
 # Changelog
 Все значимые изменения проекта фиксируются в этом файле.
+## [1.5.5] - 2026-03-10
+### Fixed
+- Исправлено поведение графика в режиме архивирования `только по изменению`:
+  - если значение не меняется, линия теперь продолжает обновляться по текущему времени в UI (виртуальные точки),
+  - при этом в БД дополнительные точки не пишутся (экономия архива сохраняется).
+- Исправлено “зависание времени” в таблице/графике при неизменных значениях:
+  - отображается актуальный текущий момент без принудительной записи в архив.
+
+## [1.5.4] - 2026-03-10
+### Fixed
+- Устранены лаги `TrendClient` при работе с удаленными источниками по сети:
+  - удаленный live-poll переведен в неблокирующий режим (через фоновые задачи),
+  - UI больше не блокируется на сетевых таймаутах.
+- Устранено “дребезжание” состояния подключения (`подключено/не подключено`) при кратковременных сетевых потерях:
+  - добавлен устойчивый расчет состояния по последнему успешному ответу (TTL),
+  - добавлен backoff на повторные неуспешные запросы к удаленному источнику.
+
+### Changed
+- Снижен timeout загрузки стартовой remote-history, чтобы уменьшить фризы при запуске онлайн-просмотра.
+- Добавлено корректное завершение фонового пула удаленных запросов при закрытии приложения.
+
+## [1.5.3] - 2026-03-10
+### Fixed
+- Исправлена ложная индикация `recorder не запущен` при живом процессе (Windows):
+  - проверка PID сделана более надежной,
+  - добавлено восстановление PID из `recorder_status.json`, если `recorder.pid` потерян/сброшен.
+- Исправлена рассинхронизация между фактическим состоянием recorder и UI/tray:
+  - `TrendClient` и `TrendRecorder` теперь используют единый `resolve_recorder_pid()`.
+
+### Added
+- Новые тесты устойчивости по PID-синхронизации:
+  - `tests/test_recorder_shared.py`.
+
+## [1.5.2] - 2026-03-10
+### Fixed
+- Исправлен критический запуск внешнего регистратора из `TrendClient.exe`:
+  - клиент теперь ищет и запускает соседний `TrendRecorder.exe`,
+  - убран ошибочный сценарий, когда клиент запускал сам себя с `--recorder`.
+- Исправлен сценарий `Старт` в UI: добавлено явное ожидание подтверждения старта регистратора и понятная ошибка, если старт не подтвержден.
+
+### Changed
+- Добавлена защита от запуска второго экземпляра:
+  - `TrendClient` (single-instance),
+  - `TrendRecorder` в tray-режиме (single-instance).
+- Упрощено верхнее меню для последовательного сценария:
+  - `Настройка`: `1) Подключение`, `2) Сигналы графика`,
+  - `Рабочий процесс`: `3) Старт`, `4) Стоп`,
+  - редко используемые окна перенесены в `Настройка -> Дополнительно`.
+- Обновлен `README` и тексты по сборке/ролям:
+  - Windows: только `TrendClient.exe` + `TrendRecorder.exe`.
+- Linux сборка упрощена: убран отдельный `TrendRecorderTray` из `build_roles_linux.sh`.
+- Усилен `build_roles_windows.ps1`: теперь скрипт останавливается при ошибке шага (нет ложного `Build complete` при неудачной сборке).
+
+## [1.4.0] - 2026-03-10
+### Added
+- Recorder API v1 (`HTTP`):
+  - `GET /v1/health`
+  - `GET /v1/tags`
+  - `GET /v1/live` (включая `bootstrap=1` для инициализации курсоров)
+  - `GET /v1/history`
+  - `GET /v1/config`
+  - `PUT /v1/config`
+  - `POST /v1/modbus/read`
+  - `POST /v1/modbus/write`
+- Новое окно `Источники данных (регистраторы)`:
+  - ручное добавление/редактирование источников,
+  - автоматический сканер локальной сети по подсети (`x.x.x.x/24`) и порту API,
+  - проверка статуса источников.
+- Импорт тегов из выбранных recorder-источников в `Сигналы графика`.
+- Поддержка mixed-source сигналов в профиле:
+  - локальные сигналы (`source_id=local`),
+  - удалённые сигналы (`source_id=<id источника>`, `remote_tag_id=<id тега>`).
+- В окне `Регистры Modbus` добавлен выбор источника:
+  - локальный прямой Modbus,
+  - любой подключённый recorder (чтение/запись через API).
+
+### Changed
+- Онлайн-просмотр графика теперь может работать в трёх сценариях:
+  - только локальный recorder,
+  - только удалённые recorder,
+  - смешанный режим локальный + удалённые.
+- При старте live-просмотра добавлена подгрузка хвоста истории с удалённых recorder.
+- В конфигурацию профиля добавлены настройки Recorder API:
+  - `recorder_api_enabled`, `recorder_api_host`, `recorder_api_port`, `recorder_api_token`.
+- Recorder runtime теперь поддерживает динамическое применение профиля через API (`PUT /v1/config`).
+
 ## [1.3.0] - 2026-03-10
 ### Changed
 - Switched online workflow to single-source architecture:
@@ -304,3 +390,25 @@
 
 
 
+
+## [1.5.0] - 2026-03-10
+### Added
+- Separate role entrypoints:
+  - `client_main.py` (Viewer/Configurator),
+  - `recorder_main.py` (headless Recorder, no UI),
+  - `recorder_tray_main.py` (Tray Recorder).
+- New Windows split build script:
+  - `build_roles_windows.ps1` -> `TrendClient.exe`, `TrendRecorder.exe`, `TrendRecorderTray.exe`.
+- New Linux split build script:
+  - `build_roles_linux.sh` -> `dist/TrendClient`, `dist/TrendRecorder`, `dist/TrendRecorderTray`.
+- New Debian packaging script for split roles:
+  - `build_deb_roles.sh` -> `trend-client_<ver>_<arch>.deb`, `trend-recorder_<ver>_<arch>.deb`.
+- Linux systemd unit template for headless recorder:
+  - `packaging/linux/trend-recorder.service`.
+- Remote profile apply from client to selected recorder source:
+  - In `Источники данных` window added button `Применить профиль на источник`,
+  - sends `PUT /v1/config` to selected recorder.
+
+### Changed
+- Version bumped to `1.5.0`.
+- Multi-source workflow now better matches deployment model with dedicated headless recorder binary.

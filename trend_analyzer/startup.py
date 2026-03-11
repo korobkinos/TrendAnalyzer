@@ -11,7 +11,10 @@ if sys.platform == "win32":
 def startup_command(extra_args: list[str] | None = None) -> str:
     args = [str(item) for item in (extra_args or []) if str(item).strip()]
     if getattr(sys, "frozen", False):
-        exe_path = Path(sys.executable).resolve()
+        try:
+            exe_path = Path(sys.argv[0]).resolve()
+        except Exception:
+            exe_path = Path(sys.executable).resolve()
         return subprocess.list2cmdline([str(exe_path), *args])
     exe_path = Path(sys.executable).resolve()
     main_path = Path(__file__).resolve().parent.parent / "main.py"
