@@ -6,6 +6,7 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt
+.\.venv\Scripts\python.exe scripts\preflight_check.py
 
 .\.venv\Scripts\python.exe assets\make_icon.py
 

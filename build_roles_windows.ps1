@@ -19,20 +19,26 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 
 Invoke-Step "Upgrade pip" { .\.venv\Scripts\python.exe -m pip install --upgrade pip }
 Invoke-Step "Install requirements" { .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-build.txt }
+Invoke-Step "Preflight checks" { .\.venv\Scripts\python.exe scripts\preflight_check.py }
 Invoke-Step "Generate app icon" { .\.venv\Scripts\python.exe assets\make_icon.py }
 
 # Clean old/legacy binaries to avoid confusion.
 $legacy = @(
   "dist\\TrendAnalyzer.exe",
   "dist\\TrendRecorderCore.exe",
-  "dist\\TrendRecorderTray.exe"
+  "dist\\TrendRecorderTray.exe",
+  "dist\\TrendClient.exe",
+  "dist\\TrendRecorder.exe"
 )
 foreach ($item in $legacy) {
   if (Test-Path $item) {
     try {
       Remove-Item -Force $item -ErrorAction Stop
     } catch {
-      Write-Warning "Cannot remove $item (probably in use). Continue build."
+      Write-Warning "Cannot remove $item (probably in use)."
+      if ($item -like "*TrendClient.exe" -or $item -like "*TrendRecorder.exe") {
+        throw "File $item is locked. Close running TrendClient/TrendRecorder and retry build."
+      }
     }
   }
 }

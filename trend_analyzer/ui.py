@@ -25,8 +25,8 @@ from urllib import request as urlrequest
 import uuid
 import zipfile
 
-from PySide6.QtCore import QDateTime, QEvent, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPageLayout, QPageSize, QPen, QPixmap
+from PySide6.QtCore import QDateTime, QEvent, QMimeData, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDrag, QFont, QIcon, QPainter, QPageLayout, QPageSize, QPen, QPixmap
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -85,6 +85,7 @@ from .startup import set_windows_autostart
 from .logging_utils import setup_logging
 from .history_restore import compute_live_history_span_s
 from .instance_lock import SingleInstanceLock, show_already_running_message
+from .stability_policy import should_force_auto_x_on_start, should_preload_history_on_profile_load
 from .recorder_shared import (
     RECORDER_CONFIG_FORMAT,
     RECORDER_CONFIG_PATH,
@@ -113,7 +114,7 @@ ROLE_SIGNAL_ID = int(Qt.ItemDataRole.UserRole)
 ROLE_SIGNAL_SOURCE_ID = ROLE_SIGNAL_ID + 1
 ROLE_SIGNAL_REMOTE_TAG_ID = ROLE_SIGNAL_ID + 2
 
-from .chart import MultiAxisChart, format_ts_ms
+from .chart import MultiAxisChart, SIGNAL_IDS_MIME_TYPE, format_ts_ms
 
 
 def _detached_process_env() -> dict[str, str]:
@@ -349,6 +350,84 @@ class AutoClearStatusLabel(QLabel):
         super().setText(self._idle_text)
 
 
+class SignalValuesTable(QTableWidget):
+    def __init__(self, rows: int = 0, columns: int = 0, parent: QWidget | None = None):
+        super().__init__(rows, columns, parent)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setDragDropOverwriteMode(False)
+
+    def _selected_signal_ids(self) -> list[str]:
+        signal_ids: list[str] = []
+        seen: set[str] = set()
+        selected_rows = sorted({idx.row() for idx in self.selectedIndexes() if idx.row() >= 0})
+        for row in selected_rows:
+            checkbox = self.cellWidget(row, 0)
+            if not isinstance(checkbox, QCheckBox):
+                continue
+            signal_id = str(checkbox.property("signal_id") or "").strip()
+            if not signal_id or signal_id in seen:
+                continue
+            seen.add(signal_id)
+            signal_ids.append(signal_id)
+        return signal_ids
+
+    def startDrag(self, _supportedActions):  # type: ignore[override]
+        signal_ids = self._selected_signal_ids()
+        if not signal_ids:
+            return
+        mime = QMimeData()
+        mime.setData(SIGNAL_IDS_MIME_TYPE, "\n".join(signal_ids).encode("utf-8"))
+        mime.setText(", ".join(signal_ids))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+
+class SignalLibraryTable(QTableWidget):
+    def __init__(self, rows: int = 0, columns: int = 0, parent: QWidget | None = None):
+        super().__init__(rows, columns, parent)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setDragDropOverwriteMode(False)
+
+    def _selected_signal_ids(self) -> list[str]:
+        signal_ids: list[str] = []
+        seen: set[str] = set()
+        selected_rows = sorted({idx.row() for idx in self.selectedIndexes() if idx.row() >= 0})
+        for row in selected_rows:
+            signal_id = ""
+            name_item = self.item(row, 1)
+            if isinstance(name_item, QTableWidgetItem):
+                signal_id = str(name_item.data(ROLE_SIGNAL_ID) or "").strip()
+            if not signal_id:
+                for col in range(self.columnCount()):
+                    item = self.item(row, col)
+                    if not isinstance(item, QTableWidgetItem):
+                        continue
+                    signal_id = str(item.data(ROLE_SIGNAL_ID) or "").strip()
+                    if signal_id:
+                        break
+            if not signal_id or signal_id in seen:
+                continue
+            seen.add(signal_id)
+            signal_ids.append(signal_id)
+        return signal_ids
+
+    def startDrag(self, _supportedActions):  # type: ignore[override]
+        signal_ids = self._selected_signal_ids()
+        if not signal_ids:
+            return
+        mime = QMimeData()
+        mime.setData(SIGNAL_IDS_MIME_TYPE, "\n".join(signal_ids).encode("utf-8"))
+        mime.setText(", ".join(signal_ids))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -420,10 +499,19 @@ class MainWindow(QMainWindow):
         self._db_live_timer.setSingleShot(False)
         self._db_live_timer.setInterval(300)
         self._db_live_timer.timeout.connect(self._poll_db_live_stream)
+        self._history_view_timer = QTimer(self)
+        self._history_view_timer.setSingleShot(True)
+        self._history_view_timer.setInterval(220)
+        self._history_view_timer.timeout.connect(self._reload_visible_history_from_db)
         self._pending_render_samples: list[tuple[float, dict[str, tuple[str, float]]]] = []
         # Backpressure cap for UI queue to avoid high RAM usage when UI redraw
         # cannot keep up with very fast polling / many signals.
         self._max_pending_render_batches = 1200
+        self._pending_history_x_range: tuple[float, float] | None = None
+        self._history_loaded_range: tuple[float, float] | None = None
+        self._history_loaded_bucket_s: float | None = None
+        self._history_reload_guard = False
+        self._last_applied_work_mode: str | None = None
         self._runtime_connected = False
         self._cpu_count = max(1, int(os.cpu_count() or 1))
         self._last_proc_cpu_time = time.process_time()
@@ -471,7 +559,7 @@ class MainWindow(QMainWindow):
         self.mode_combo.currentIndexChanged.connect(self._on_mode_combo_changed)
 
         self.status_label = AutoClearStatusLabel(
-            'Статус: шаги — 1) Подключение  2) Сигналы  3) Старт',
+            'Статус: ожидание',
             5000,
             self,
         )
@@ -570,7 +658,7 @@ class MainWindow(QMainWindow):
 
         values_layout.addWidget(values_header)
 
-        self.values_table = QTableWidget(0, 7)
+        self.values_table = SignalValuesTable(0, 7)
         self.values_table.setHorizontalHeaderLabels(['Вид', 'Сигнал', 'Шкала', 'Значение', 'Время', 'Источник', 'Цвет'])
         header = self.values_table.horizontalHeader()
         header.setStretchLastSection(False)
@@ -596,8 +684,10 @@ class MainWindow(QMainWindow):
         self.chart.auto_mode_changed.connect(self._on_chart_auto_mode_changed)
         self.chart.cursor_enabled_changed.connect(self._on_chart_cursor_enabled_changed)
         self.chart.stats_range_changed.connect(self._on_chart_stats_range_changed)
+        self.chart.x_range_changed.connect(self._on_chart_x_range_changed)
         self.chart.display_updated.connect(self._update_values_table)
         self.chart.scales_changed.connect(self._update_scales_table)
+        self.chart.signals_dropped.connect(self._on_chart_signals_dropped)
         self.chart.export_image_requested.connect(self._export_chart_image)
         self.chart.export_csv_requested.connect(self._export_chart_csv)
         self.chart.print_requested.connect(self._print_chart)
@@ -1101,7 +1191,7 @@ class MainWindow(QMainWindow):
         self.signal_source_tabs.currentChanged.connect(self._on_signal_source_tab_changed)
         layout.addWidget(self.signal_source_tabs)
 
-        self.signal_table = QTableWidget(0, 11)
+        self.signal_table = SignalLibraryTable(0, 11, self.signals_window)
         self.signal_table.setHorizontalHeaderLabels(
             ['Вкл', 'Имя', 'Адрес', 'Регистр', 'Тип', 'Бит', 'Шкала', 'Порядок REAL', 'Коэфф.', 'Цвет', 'Источник']
         )
@@ -1617,7 +1707,7 @@ class MainWindow(QMainWindow):
                 float_order=str(item.get("float_order") or "ABCD"),
                 scale=float(item.get("scale") or 1.0),
                 color=str(item.get("color") or DEFAULT_COLORS[(len(self.current_profile.signals) + added) % len(DEFAULT_COLORS)]),
-                enabled=bool(item.get("enabled", True)),
+                enabled=False,
                 source_id=str(source.id),
                 remote_tag_id=remote_tag_id,
             )
@@ -1888,7 +1978,9 @@ class MainWindow(QMainWindow):
             self._fill_signal_table(self.current_profile.signals, source_id=self._current_signal_source_id())
             self._fit_signal_table_columns(initial=False)
             self._apply_current_profile()
-            self.status_label.setText(f"Статус: импортировано тегов: {added}")
+            self.status_label.setText(
+                f"Статус: импортировано тегов: {added}. Они в таблице; перетащите нужные строки на график."
+            )
         else:
             self.status_label.setText('Статус: новых тегов для импорта не найдено')
 
@@ -1944,7 +2036,9 @@ class MainWindow(QMainWindow):
                 self._fit_signal_table_columns(initial=False)
                 self._apply_current_profile()
         if added > 0:
-            self.status_label.setText(f"Статус: импортировано выбранных тегов: {added}")
+            self.status_label.setText(
+                f"Статус: импортировано выбранных тегов: {added}. Они в таблице; перетащите нужные строки на график."
+            )
         else:
             self.status_label.setText('Статус: выбранные теги уже были импортированы')
 
@@ -1969,6 +2063,149 @@ class MainWindow(QMainWindow):
         profile_payload["ui_state"] = {}
         return profile_payload
 
+    def _apply_profile_to_source_runtime(
+        self,
+        source: RecorderSourceConfig,
+        row: int | None = None,
+        timeout_s: float = 2.5,
+        update_status: bool = True,
+    ) -> tuple[bool, str]:
+        payload_profile = self._build_remote_profile_payload_for_source(source.id)
+        try:
+            response = self._source_request_json(
+                source,
+                "PUT",
+                "/v1/config",
+                payload={"profile": payload_profile},
+                timeout_s=float(max(0.5, timeout_s)),
+            )
+        except Exception as exc:
+            return False, f"apply_failed: {exc}"
+
+        if not bool(response.get("ok", False)):
+            message = str(response.get("message") or response.get("error") or "n/a")
+            return False, f"apply_failed: {message}"
+
+        source_sid = str(source.id or "").strip()
+        bindings_updated = 0
+        for signal in self.current_profile.signals:
+            sid = str(getattr(signal, "source_id", "local") or "local").strip() or "local"
+            if sid != source_sid:
+                continue
+            remote_tag_id = str(getattr(signal, "remote_tag_id", "") or "").strip()
+            if remote_tag_id:
+                continue
+            signal.remote_tag_id = str(getattr(signal, "id", "") or "").strip()
+            bindings_updated += 1
+
+        if bindings_updated > 0:
+            if self._current_signal_source_id() == source_sid:
+                self._fill_signal_table(self.current_profile.signals, source_id=source_sid)
+                self._fit_signal_table_columns(initial=False)
+            self._mark_config_dirty()
+
+        if row is None:
+            sources_rows = self._collect_sources_table()
+            for idx, item in enumerate(sources_rows):
+                if str(getattr(item, "id", "") or "") == source_sid:
+                    row = idx
+                    break
+        if row is not None and row >= 0:
+            try:
+                self._connect_source_row(int(row), source, timeout_s=1.2, ensure_enabled=True)
+            except Exception:
+                pass
+
+        message = (
+            f"Профиль отправлен на {source.name} ({source.host}:{source.port}), "
+            f"сигналов: {len(payload_profile.get('signals') or [])}"
+        )
+        if update_status:
+            self.status_label.setText(f"Статус: {message}")
+        return True, message
+
+    def _auto_sync_remote_profiles_for_live(self) -> tuple[int, int]:
+        source_ids_with_signals = {
+            str(getattr(signal, "source_id", "local") or "local").strip()
+            for signal in list(getattr(self.current_profile, "signals", []) or [])
+            if str(getattr(signal, "source_id", "local") or "local").strip() not in {"", "local"}
+        }
+        if not source_ids_with_signals:
+            return 0, 0
+
+        source_rows = self._collect_sources_table()
+        row_by_source_id = {str(item.id): idx for idx, item in enumerate(source_rows)}
+        sources_by_id = {
+            str(source.id): source
+            for source in list(getattr(self.current_profile, "recorder_sources", []) or [])
+            if bool(getattr(source, "enabled", False))
+        }
+
+        applied = 0
+        failed = 0
+        for source_id in sorted(source_ids_with_signals):
+            source = sources_by_id.get(source_id)
+            if source is None:
+                continue
+
+            source_signals = [
+                signal
+                for signal in self.current_profile.signals
+                if str(getattr(signal, "source_id", "local") or "local").strip() == source_id
+            ]
+            if not source_signals:
+                continue
+
+            need_apply = False
+            try:
+                tags_payload = self._source_request_json(
+                    source,
+                    "GET",
+                    "/v1/tags",
+                    timeout_s=max(0.6, self._remote_live_timeout_s()),
+                )
+                if bool(tags_payload.get("ok", False)):
+                    tags_raw = tags_payload.get("tags")
+                    tag_ids = set()
+                    if isinstance(tags_raw, list):
+                        for item in tags_raw:
+                            if not isinstance(item, dict):
+                                continue
+                            rid = str(item.get("id") or "").strip()
+                            if rid:
+                                tag_ids.add(rid)
+                    matched = 0
+                    for signal in source_signals:
+                        remote_tag_id = str(getattr(signal, "remote_tag_id", "") or "").strip()
+                        if remote_tag_id and remote_tag_id in tag_ids:
+                            matched += 1
+                    # If none of configured signal bindings exist on source,
+                    # source profile is likely stale for this viewer config.
+                    if matched <= 0:
+                        need_apply = True
+                else:
+                    need_apply = True
+            except Exception:
+                # Unreachable source: do not force apply, let regular live polling
+                # and reconnect logic handle the source.
+                continue
+
+            if not need_apply:
+                continue
+
+            ok, _msg = self._apply_profile_to_source_runtime(
+                source,
+                row=row_by_source_id.get(source_id),
+                timeout_s=max(1.2, self._remote_live_timeout_s() * 3.0),
+                update_status=False,
+            )
+            if ok:
+                applied += 1
+            else:
+                failed += 1
+
+        return applied, failed
+
     def _on_apply_profile_to_source_clicked(self, _checked: bool = False) -> None:
         self._store_signal_table_to_profile(self.current_profile)
         selected_rows = sorted({idx.row() for idx in self.sources_table.selectedIndexes()})
@@ -1981,49 +2218,24 @@ class MainWindow(QMainWindow):
             self.status_label.setText('Статус: выбранный источник не найден')
             return
         source = sources[row]
-        payload_profile = self._build_remote_profile_payload_for_source(source.id)
         try:
             with self._busy(f"Статус: отправка профиля на {source.host}:{source.port}..."):
-                response = self._source_request_json(
+                ok, message = self._apply_profile_to_source_runtime(
                     source,
-                    "PUT",
-                    "/v1/config",
-                    payload={"profile": payload_profile},
+                    row=row,
                     timeout_s=2.5,
+                    update_status=False,
                 )
         except Exception as exc:
             self.status_label.setText(
                 f"Ошибка: не удалось применить профиль на {source.host}:{source.port}: {exc}"
             )
             return
-        if bool(response.get("ok", False)):
-            source_sid = str(source.id or "").strip()
-            bindings_updated = 0
-            for signal in self.current_profile.signals:
-                sid = str(getattr(signal, "source_id", "local") or "local").strip() or "local"
-                if sid != source_sid:
-                    continue
-                remote_tag_id = str(getattr(signal, "remote_tag_id", "") or "").strip()
-                if remote_tag_id:
-                    continue
-                signal.remote_tag_id = str(getattr(signal, "id", "") or "").strip()
-                bindings_updated += 1
-
-            if bindings_updated > 0:
-                if self._current_signal_source_id() == source_sid:
-                    self._fill_signal_table(self.current_profile.signals, source_id=source_sid)
-                    self._fit_signal_table_columns(initial=False)
-                self._mark_config_dirty()
-
-            self._connect_source_row(row, source, timeout_s=1.2, ensure_enabled=True)
-            self.status_label.setText(
-                f"Статус: профиль отправлен на {source.name} ({source.host}:{source.port}), "
-                f"сигналов: {len(payload_profile.get('signals') or [])}"
-            )
+        if ok:
+            self.status_label.setText(f"Статус: {message}")
         else:
             self.status_label.setText(
-                f"Ошибка применения профиля на {source.name}: "
-                f"{response.get('message') or response.get('error') or 'n/a'}"
+                f"Ошибка применения профиля на {source.name}: {message}"
             )
 
     def _build_tags_window(self) -> None:
@@ -3371,11 +3583,11 @@ class MainWindow(QMainWindow):
         view_menu = menu_bar.addMenu('Вид')
         self.action_auto_x = QAction('Авто X', self, checkable=True)
         self.action_auto_x.setChecked(True)
-        self.action_auto_x.triggered.connect(self._on_action_auto_x_toggled)
+        self.action_auto_x.toggled.connect(self._on_action_auto_x_toggled)
         view_menu.addAction(self.action_auto_x)
         self.action_cursor = QAction('Курсор', self, checkable=True)
         self.action_cursor.setChecked(False)
-        self.action_cursor.triggered.connect(self._on_action_cursor_toggled)
+        self.action_cursor.toggled.connect(self._on_action_cursor_toggled)
         view_menu.addAction(self.action_cursor)
         self.action_reset_zoom = QAction('Сброс масштаба', self)
         self.action_reset_zoom.triggered.connect(lambda _checked=False: self.chart.reset_view())
@@ -3645,6 +3857,20 @@ class MainWindow(QMainWindow):
             self.values_auto_x_checkbox.blockSignals(True)
             self.values_auto_x_checkbox.setChecked(state)
             self.values_auto_x_checkbox.blockSignals(False)
+        mode = str(self.mode_combo.currentData() or "online")
+        if mode == "online" and bool(self.current_profile.render_chart_enabled):
+            if state:
+                self._pending_render_samples = []
+                self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
+                try:
+                    x_left, x_right = self.chart.current_x_range()
+                    span_s = max(10.0, float(x_right - x_left))
+                except Exception:
+                    span_s = self._preferred_live_history_span_s()
+                self._load_recent_remote_history_from_sources(span_s)
+                self._reset_history_window_cache()
+            else:
+                self._schedule_visible_history_reload(force=True)
         self._mark_config_dirty()
 
     def _on_action_cursor_toggled(self, checked: bool) -> None:
@@ -3660,7 +3886,22 @@ class MainWindow(QMainWindow):
         state = bool(checked)
         if self.action_auto_x.isChecked() != state:
             self.action_auto_x.setChecked(state)
+            return
         self.chart.set_auto_x(state)
+        mode = str(self.mode_combo.currentData() or "online")
+        if mode == "online" and bool(self.current_profile.render_chart_enabled):
+            if state:
+                self._pending_render_samples = []
+                self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
+                try:
+                    x_left, x_right = self.chart.current_x_range()
+                    span_s = max(10.0, float(x_right - x_left))
+                except Exception:
+                    span_s = self._preferred_live_history_span_s()
+                self._load_recent_remote_history_from_sources(span_s)
+                self._reset_history_window_cache()
+            else:
+                self._schedule_visible_history_reload(force=True)
         self._mark_config_dirty()
 
     def _on_values_cursor_toggled(self, checked: bool) -> None:
@@ -3945,6 +4186,32 @@ class MainWindow(QMainWindow):
         # Column-width persistence is intentionally disabled.
         return False
 
+    def _collect_active_signal_ids(self, profile: ProfileConfig | None = None) -> list[str]:
+        target = profile if isinstance(profile, ProfileConfig) else self.current_profile
+        active_ids: list[str] = []
+        seen: set[str] = set()
+        for signal in getattr(target, "signals", []):
+            signal_id = str(getattr(signal, "id", "") or "").strip()
+            if not signal_id or signal_id in seen:
+                continue
+            seen.add(signal_id)
+            if bool(getattr(signal, "enabled", True)):
+                active_ids.append(signal_id)
+        return active_ids
+
+    def _apply_active_signal_ids_from_ui_state(self, profile: ProfileConfig) -> None:
+        state = profile.ui_state if isinstance(profile.ui_state, dict) else {}
+        view = state.get("view")
+        if not isinstance(view, dict):
+            return
+        raw_ids = view.get("active_signal_ids")
+        if not isinstance(raw_ids, list):
+            return
+        active_ids = {str(item).strip() for item in raw_ids if str(item).strip()}
+        for signal in profile.signals:
+            signal_id = str(getattr(signal, "id", "") or "").strip()
+            signal.enabled = bool(signal_id and signal_id in active_ids)
+
     def _collect_view_state_payload(self) -> dict[str, object]:
         x_min, x_max = self.chart.current_x_range()
         return {
@@ -3960,6 +4227,7 @@ class MainWindow(QMainWindow):
             "values_panel_closed": bool(self._values_closed),
             "x_range": [float(x_min), float(x_max)],
             "scale_states": self.chart.export_scale_states(),
+            "active_signal_ids": self._collect_active_signal_ids(),
             "stats_markers_enabled": bool(self.stats_markers_checkbox.isChecked()),
             "stats_start_ms": int(self.stats_start_edit.dateTime().toMSecsSinceEpoch()),
             "stats_end_ms": int(self.stats_end_edit.dateTime().toMSecsSinceEpoch()),
@@ -4137,6 +4405,7 @@ class MainWindow(QMainWindow):
 
     def _load_profile_to_ui(self, profile: ProfileConfig) -> None:
         self._normalize_profile_signal_sources(profile)
+        self._apply_active_signal_ids_from_ui_state(profile)
         self._stop_tags_polling(silent=True)
         self._updating_ui = True
         self.profile_name_edit.setText(profile.name)
@@ -4186,13 +4455,12 @@ class MainWindow(QMainWindow):
         self._schedule_apply_saved_widths_all_tables(profile.id)
         self._apply_work_mode_ui(profile.work_mode)
         self._sync_mode_actions()
-        if (
-            str(profile.work_mode or "online") == "online"
-            and bool(profile.render_chart_enabled)
-            and (self._worker is None or not self._worker.isRunning())
+        if should_preload_history_on_profile_load(
+            work_mode=str(profile.work_mode or "online"),
+            render_chart_enabled=bool(profile.render_chart_enabled),
+            live_running=bool(self._worker is not None and self._worker.isRunning()),
         ):
-            auto_x_enabled = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True
-            self._load_recent_online_history_from_db(adjust_x_range=auto_x_enabled, silent=True)
+            self._load_offline_initial_history_from_db(silent=True)
         self._update_recorder_dependent_ui_state()
 
     @staticmethod
@@ -4704,19 +4972,14 @@ class MainWindow(QMainWindow):
             signal = SignalConfig(
                 name=f"Signal {row + 1}",
                 color=DEFAULT_COLORS[row % len(DEFAULT_COLORS)],
+                enabled=False,
                 source_id=selected_source_id,
             )
-            if selected_source_id != "local":
-                # For manually created remote signals, default binding to own id
-                # so they can be matched after "apply profile to source".
-                signal.remote_tag_id = str(signal.id or "")
 
         signal_source_id = str(getattr(signal, "source_id", "local") or "local").strip() or "local"
         signal_remote_tag_id = str(getattr(signal, "remote_tag_id", "") or "").strip()
         if signal_source_id == "local":
             signal_remote_tag_id = ""
-        elif not signal_remote_tag_id:
-            signal_remote_tag_id = str(getattr(signal, "id", "") or "").strip()
 
         enabled_item = QTableWidgetItem()
         enabled_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
@@ -4823,11 +5086,9 @@ class MainWindow(QMainWindow):
                 scale=1.0,
                 unit="",
                 color=DEFAULT_COLORS[row % len(DEFAULT_COLORS)],
-                enabled=True,
+                enabled=False,
                 source_id=selected_source_id,
             )
-            if selected_source_id != "local":
-                signal.remote_tag_id = str(signal.id or "")
             self._add_signal_row(signal)
 
         self._fit_signal_table_columns(initial=False)
@@ -4945,6 +5206,38 @@ class MainWindow(QMainWindow):
             signal_ids.append(signal_id)
         return signal_ids
 
+    def _on_chart_signals_dropped(self, payload: object) -> None:
+        signal_ids = [str(item).strip() for item in list(payload or []) if str(item).strip()]
+        if not signal_ids:
+            return
+        unique_ids: list[str] = []
+        seen: set[str] = set()
+        for signal_id in signal_ids:
+            if signal_id in seen:
+                continue
+            seen.add(signal_id)
+            unique_ids.append(signal_id)
+        if not unique_ids:
+            return
+
+        id_set = set(unique_ids)
+        changed = False
+        for signal in self.current_profile.signals:
+            sid = str(signal.id or "")
+            if sid not in id_set:
+                continue
+            if not bool(signal.enabled):
+                signal.enabled = True
+                changed = True
+
+        self.chart.set_signals_enabled(unique_ids, True)
+        for signal_id in unique_ids:
+            self._sync_signal_table_enabled(signal_id, True)
+
+        if changed:
+            self._mark_config_dirty()
+        self.status_label.setText(f"Статус: добавлено на график сигналов ({len(unique_ids)})")
+
     def _set_values_signals_visibility(self, signal_ids: list[str], visible: bool) -> None:
         visible_state = bool(visible)
         unique_ids = [sid for sid in signal_ids if str(sid).strip()]
@@ -4961,20 +5254,9 @@ class MainWindow(QMainWindow):
                 changed = True
             signal.enabled = visible_state
 
+        self.chart.set_signals_enabled(unique_ids, visible_state)
         for signal_id in unique_ids:
-            self.chart.set_signal_enabled(signal_id, visible_state)
             self._sync_signal_table_enabled(signal_id, visible_state)
-
-        for row in range(self.values_table.rowCount()):
-            checkbox = self.values_table.cellWidget(row, 0)
-            if not isinstance(checkbox, QCheckBox):
-                continue
-            signal_id = str(checkbox.property("signal_id") or "").strip()
-            if signal_id not in unique_set:
-                continue
-            checkbox.blockSignals(True)
-            checkbox.setChecked(visible_state)
-            checkbox.blockSignals(False)
 
         if changed:
             self._mark_config_dirty()
@@ -5272,6 +5554,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         previous_signals_signature = [signal.to_dict() for signal in self.current_profile.signals]
         self._store_ui_to_profile(self.current_profile, ensure_signal_minimum=ensure_signal_minimum)
+        self._apply_active_signal_ids_from_ui_state(self.current_profile)
         current_name = self.current_profile.name
         combo_index = self.profile_combo.currentIndex()
         self.profile_combo.setItemText(combo_index, current_name)
@@ -5280,6 +5563,7 @@ class MainWindow(QMainWindow):
         if history_span_s is None and mode == "online":
             history_span_s = self._preferred_live_history_span_s()
         self.chart.configure_signals(self.current_profile.signals)
+        self._reset_history_window_cache()
         self.chart.set_visual_settings(
             background_color=self.current_profile.plot_background_color,
             grid_color=self.current_profile.plot_grid_color,
@@ -5303,6 +5587,8 @@ class MainWindow(QMainWindow):
             if self._db_live_timer.isActive():
                 self._db_live_timer.setInterval(max(120, min(2000, int(self.current_profile.poll_interval_ms))))
             self._apply_work_mode_ui(mode)
+            if mode == "offline" and bool(self.current_profile.render_chart_enabled):
+                self._schedule_visible_history_reload(force=True)
 
         self._save_recorder_config_snapshot(silent=True)
         self._push_profile_to_local_recorder(silent=True)
@@ -6099,6 +6385,8 @@ class MainWindow(QMainWindow):
                 except Exception:
                     span_s = 120.0
                 self._load_recent_remote_history_from_sources(span_s)
+            else:
+                self._load_offline_initial_history_from_db(silent=True)
             if self._is_live_stream_running():
                 if not self._render_timer.isActive():
                     self._apply_render_interval_runtime(self.current_profile.render_interval_ms)
@@ -6109,6 +6397,7 @@ class MainWindow(QMainWindow):
                 self._render_timer.stop()
             self.chart.set_connection_events([])
             self.chart.clear_data()
+            self._reset_history_window_cache()
         self._update_runtime_status_panel()
         if not self._updating_ui:
             self._mark_config_dirty()
@@ -6128,6 +6417,8 @@ class MainWindow(QMainWindow):
 
     def _apply_work_mode_ui(self, mode: str) -> None:
         online_mode = mode == "online"
+        mode_changed = self._last_applied_work_mode != mode
+        self._last_applied_work_mode = mode
 
         if not online_mode and self._is_live_stream_running():
             self._stop_worker()
@@ -6144,8 +6435,12 @@ class MainWindow(QMainWindow):
                 self.status_label.setText('Статус: онлайн режим, ожидание запуска просмотра')
             else:
                 self.status_label.setText('Статус: онлайн режим, просмотр из БД запущен')
+            if mode_changed:
+                self._reset_history_window_cache()
         else:
             self.status_label.setText('Статус: офлайн режим (архив)')
+            if mode_changed and bool(self.current_profile.render_chart_enabled):
+                self._load_offline_initial_history_from_db(silent=True)
         self._update_runtime_status_panel()
         self._update_recorder_dependent_ui_state()
 
@@ -7085,6 +7380,291 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(f"РЎС‚Р°С‚СѓСЃ: Р°СЂС…РёРІ Р·Р°РіСЂСѓР¶РµРЅ <- {file_path}")
 
+    def _is_auto_x_enabled(self) -> bool:
+        if hasattr(self, "action_auto_x"):
+            try:
+                return bool(self.action_auto_x.isChecked())
+            except Exception:
+                return True
+        return True
+
+    def _reset_history_window_cache(self) -> None:
+        self._pending_history_x_range = None
+        self._history_loaded_range = None
+        self._history_loaded_bucket_s = None
+        if self._history_view_timer.isActive():
+            self._history_view_timer.stop()
+
+    def _target_history_points(self) -> int:
+        try:
+            width_px = int(self.chart.plot_widget.width())
+        except Exception:
+            width_px = 1200
+        width_px = max(320, width_px)
+        # 2*width gives enough detail while still bounded by decimation.
+        return max(900, min(7000, width_px * 2))
+
+    def _schedule_visible_history_reload(
+        self,
+        x_left: float | None = None,
+        x_right: float | None = None,
+        force: bool = False,
+    ) -> None:
+        if self._history_reload_guard:
+            return
+        if not bool(self.current_profile.render_chart_enabled):
+            return
+        if not self._profile_uses_local_recorder():
+            return
+
+        mode = str(self.mode_combo.currentData() or "online")
+        if mode == "online" and self._is_auto_x_enabled():
+            return
+
+        if x_left is None or x_right is None:
+            try:
+                x_left, x_right = self.chart.current_x_range()
+            except Exception:
+                return
+
+        left = float(min(x_left, x_right))
+        right = float(max(x_left, x_right))
+        span = float(right - left)
+        if not math.isfinite(span) or span <= 0.0:
+            return
+
+        target_points = self._target_history_points()
+        target_bucket_s = max(1e-6, span / float(max(32, target_points)))
+        if not force and self._history_loaded_range is not None and self._history_loaded_bucket_s is not None:
+            loaded_left, loaded_right = self._history_loaded_range
+            has_detail = float(self._history_loaded_bucket_s) <= (target_bucket_s * 1.25)
+            if left >= float(loaded_left) and right <= float(loaded_right) and has_detail:
+                return
+
+        db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
+        if not db_path.exists():
+            return
+
+        self._pending_history_x_range = (left, right)
+        delay_ms = 1 if force else int(self._history_view_timer.interval())
+        self._history_view_timer.start(max(1, delay_ms))
+
+    def _on_chart_x_range_changed(self, x_min: float, x_max: float) -> None:
+        self._schedule_visible_history_reload(float(x_min), float(x_max), force=False)
+
+    def _reload_visible_history_from_db(self) -> None:
+        pending = self._pending_history_x_range
+        self._pending_history_x_range = None
+        if pending is None:
+            return
+        left, right = pending
+        self._load_history_window_from_db(left, right, preserve_range=True, silent=True)
+
+    def _query_samples_for_window(
+        self,
+        conn: sqlite3.Connection,
+        start_ts: float,
+        end_ts: float,
+        target_points_per_signal: int,
+    ) -> tuple[dict[str, list[list[float]]], float]:
+        signal_ids = [str(signal.id) for signal in self.current_profile.signals if str(signal.id)]
+        samples_map: dict[str, list[list[float]]] = {sid: [] for sid in signal_ids}
+        if not signal_ids:
+            return samples_map, 1.0
+
+        left = float(min(start_ts, end_ts))
+        right = float(max(start_ts, end_ts))
+        window_span = max(1e-6, right - left)
+        bucket_s = max(1e-6, window_span / float(max(32, int(target_points_per_signal))))
+        archive_interval_s = max(0.05, float(getattr(self.current_profile, "archive_interval_ms", 1000) or 1000) / 1000.0)
+        raw_threshold_s = max(0.35, archive_interval_s * 1.25)
+        placeholders = ",".join("?" for _ in signal_ids)
+
+        if bucket_s <= raw_threshold_s:
+            rows = conn.execute(
+                f"""
+                SELECT signal_id, ts, value
+                FROM samples
+                WHERE profile_id = ? AND ts >= ? AND ts <= ? AND signal_id IN ({placeholders})
+                ORDER BY ts ASC, id ASC
+                """,
+                [self.current_profile.id, float(left), float(right), *signal_ids],
+            ).fetchall()
+            for signal_id, ts, value in rows:
+                sid = str(signal_id)
+                if sid not in samples_map:
+                    continue
+                try:
+                    samples_map[sid].append([float(ts), float(value)])
+                except (TypeError, ValueError):
+                    continue
+            return samples_map, max(1e-6, raw_threshold_s)
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                signal_id,
+                CAST((ts - ?) / ? AS INTEGER) AS bucket_idx,
+                MIN(ts) AS min_ts,
+                MAX(ts) AS max_ts,
+                MIN(value) AS min_value,
+                MAX(value) AS max_value
+            FROM samples
+            WHERE profile_id = ? AND ts >= ? AND ts <= ? AND signal_id IN ({placeholders})
+            GROUP BY signal_id, bucket_idx
+            ORDER BY signal_id ASC, bucket_idx ASC
+            """,
+            [float(left), float(bucket_s), self.current_profile.id, float(left), float(right), *signal_ids],
+        ).fetchall()
+
+        for signal_id, _bucket_idx, min_ts, max_ts, min_value, max_value in rows:
+            sid = str(signal_id)
+            if sid not in samples_map:
+                continue
+            try:
+                min_ts_f = float(min_ts)
+                max_ts_f = float(max_ts)
+                min_val_f = float(min_value)
+                max_val_f = float(max_value)
+            except (TypeError, ValueError):
+                continue
+
+            if abs(max_ts_f - min_ts_f) <= 1e-9:
+                samples_map[sid].append([min_ts_f, min_val_f])
+                continue
+            if min_ts_f <= max_ts_f:
+                samples_map[sid].append([min_ts_f, min_val_f])
+                samples_map[sid].append([max_ts_f, max_val_f])
+            else:
+                samples_map[sid].append([max_ts_f, max_val_f])
+                samples_map[sid].append([min_ts_f, min_val_f])
+
+        for sid, points in list(samples_map.items()):
+            if len(points) <= 1:
+                continue
+            compact: list[list[float]] = [points[0]]
+            for ts, value in points[1:]:
+                if abs(float(compact[-1][0]) - float(ts)) <= 1e-9:
+                    compact[-1] = [float(ts), float(value)]
+                else:
+                    compact.append([float(ts), float(value)])
+            samples_map[sid] = compact
+        return samples_map, float(bucket_s)
+
+    def _load_history_window_from_db(
+        self,
+        x_left: float,
+        x_right: float,
+        preserve_range: bool = True,
+        silent: bool = True,
+    ) -> bool:
+        if not self._profile_uses_local_recorder():
+            return False
+        db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
+        if not db_path.exists():
+            return False
+
+        left = float(min(x_left, x_right))
+        right = float(max(x_left, x_right))
+        if right <= left:
+            return False
+
+        span = right - left
+        margin = max(1.0, span * 0.20)
+        query_left = max(0.0, left - margin)
+        query_right = right + margin
+        target_points = self._target_history_points()
+
+        mode = str(self.mode_combo.currentData() or "online")
+        use_shared_conn = bool(mode == "online" and self._db_live_conn is not None)
+        conn: sqlite3.Connection | None = self._db_live_conn if use_shared_conn else None
+        close_conn = False
+        if conn is None:
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.execute("PRAGMA busy_timeout=2000;")
+                close_conn = True
+            except Exception:
+                return False
+
+        try:
+            samples_map, bucket_s = self._query_samples_for_window(
+                conn,
+                start_ts=float(query_left),
+                end_ts=float(query_right),
+                target_points_per_signal=target_points,
+            )
+            connection_events = self._query_connection_events(conn, float(query_left), float(query_right))
+        except Exception:
+            return False
+        finally:
+            if close_conn and conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        latest_values: dict[str, tuple[str, float]] = {}
+        signal_name_by_id = {str(item.id): str(item.name) for item in self.current_profile.signals if str(item.id)}
+        for sid, points in samples_map.items():
+            if not points:
+                continue
+            try:
+                latest_values[str(sid)] = (signal_name_by_id.get(str(sid), str(sid)), float(points[-1][1]))
+            except Exception:
+                continue
+        if latest_values:
+            self._last_live_values.update(latest_values)
+
+        self._history_reload_guard = True
+        try:
+            self.chart.set_archive_data(samples_map)
+            self.chart.set_connection_events(connection_events)
+            if preserve_range:
+                self.chart.set_x_range(float(left), float(right))
+        finally:
+            self._history_reload_guard = False
+
+        self._connection_events = connection_events
+        self._last_connection_state = None if not connection_events else bool(int(connection_events[-1][1]))
+        self._history_loaded_range = (float(query_left), float(query_right))
+        self._history_loaded_bucket_s = max(1e-6, float(bucket_s))
+
+        if not silent:
+            left_text = format_ts_ms(float(left))
+            right_text = format_ts_ms(float(right))
+            self.status_label.setText(f"Статус: загружен участок архива {left_text} .. {right_text}")
+        return True
+
+    def _load_offline_initial_history_from_db(self, silent: bool = True) -> bool:
+        if not self._profile_uses_local_recorder():
+            return False
+        db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
+        min_ts, max_ts, count = self._db_archive_range(db_path, self.current_profile.id)
+        if min_ts is None or max_ts is None or int(count) <= 0:
+            self._history_reload_guard = True
+            try:
+                self.chart.set_archive_data({})
+                self.chart.set_connection_events([])
+            finally:
+                self._history_reload_guard = False
+            self._connection_events = []
+            self._last_connection_state = None
+            self._reset_history_window_cache()
+            if not silent:
+                self.status_label.setText("Статус: архив пуст")
+            return False
+
+        span_hint = self._current_chart_span_s()
+        if span_hint is None:
+            span_hint = self._preferred_live_history_span_s()
+        span = max(20.0, float(span_hint))
+        archive_span = max(20.0, float(max_ts) - float(min_ts))
+        span = min(span, archive_span)
+        right = float(max_ts)
+        left = max(float(min_ts), right - span)
+        return self._load_history_window_from_db(left, right, preserve_range=True, silent=silent)
+
     def _current_chart_span_s(self) -> float | None:
         try:
             view_left, view_right = self.chart.current_x_range()
@@ -7221,6 +7801,9 @@ class MainWindow(QMainWindow):
         self.chart.set_connection_events(connection_events)
         self._connection_events = connection_events
         self._last_connection_state = None if not connection_events else bool(int(connection_events[-1][1]))
+        self._history_loaded_range = (float(start_ts), float(last_ts))
+        loaded_span = max(1e-6, float(last_ts) - float(start_ts))
+        self._history_loaded_bucket_s = loaded_span / float(max(32, self._target_history_points()))
 
         if adjust_x_range:
             right = float(last_ts)
@@ -7352,6 +7935,130 @@ class MainWindow(QMainWindow):
                 continue
             mapping.setdefault(source_id, {}).setdefault(remote_tag_id, []).append((str(signal.id), str(signal.name)))
         return mapping
+
+    @staticmethod
+    def _remote_bind_key(
+        address: int | str,
+        register_type: str,
+        data_type: str,
+        bit_index: int | str,
+    ) -> tuple[int, str, str, int]:
+        try:
+            addr_i = int(address)
+        except Exception:
+            addr_i = 0
+        reg = str(register_type or "").strip().lower()
+        dtype = str(data_type or "").strip().lower()
+        try:
+            bit_i = int(bit_index)
+        except Exception:
+            bit_i = 0
+        if dtype != "bool":
+            bit_i = 0
+        return (addr_i, reg, dtype, bit_i)
+
+    def _try_repair_remote_bindings(self) -> int:
+        sources_by_id = {str(source.id): source for source in self.current_profile.recorder_sources if bool(source.enabled)}
+        if not sources_by_id:
+            return 0
+
+        repaired_total = 0
+        for source_id, source in sources_by_id.items():
+            source_signals = [
+                signal
+                for signal in self.current_profile.signals
+                if str(getattr(signal, "source_id", "local") or "local") == source_id
+            ]
+            if not source_signals:
+                continue
+
+            try:
+                payload = self._source_request_json(source, "GET", "/v1/tags", timeout_s=max(0.6, self._remote_live_timeout_s()))
+            except Exception:
+                continue
+            if not bool(payload.get("ok", False)):
+                continue
+            tags_raw = payload.get("tags")
+            if not isinstance(tags_raw, list) or not tags_raw:
+                continue
+
+            tags_by_id: dict[str, dict] = {}
+            tags_by_name: dict[str, list[dict]] = {}
+            tags_by_key: dict[tuple[int, str, str, int], list[dict]] = {}
+            for item in tags_raw:
+                if not isinstance(item, dict):
+                    continue
+                tag_id = str(item.get("id") or "").strip()
+                if not tag_id:
+                    continue
+                tags_by_id[tag_id] = item
+                tag_name = str(item.get("name") or "").strip().casefold()
+                if tag_name:
+                    tags_by_name.setdefault(tag_name, []).append(item)
+                key = self._remote_bind_key(
+                    item.get("address", 0),
+                    str(item.get("register_type") or ""),
+                    str(item.get("data_type") or ""),
+                    item.get("bit_index", 0),
+                )
+                tags_by_key.setdefault(key, []).append(item)
+
+            used_ids = {
+                str(getattr(sig, "remote_tag_id", "") or "").strip()
+                for sig in source_signals
+                if str(getattr(sig, "remote_tag_id", "") or "").strip() in tags_by_id
+            }
+
+            repaired_for_source: dict[str, str] = {}
+            for signal in source_signals:
+                signal_id = str(getattr(signal, "id", "") or "").strip()
+                if not signal_id:
+                    continue
+                current_remote_id = str(getattr(signal, "remote_tag_id", "") or "").strip()
+                if current_remote_id and current_remote_id in tags_by_id:
+                    continue
+
+                candidate: dict | None = None
+                signal_name_key = str(getattr(signal, "name", "") or "").strip().casefold()
+                if signal_name_key:
+                    name_candidates = [
+                        item for item in tags_by_name.get(signal_name_key, []) if str(item.get("id") or "") not in used_ids
+                    ]
+                    if len(name_candidates) == 1:
+                        candidate = name_candidates[0]
+
+                if candidate is None:
+                    bind_key = self._remote_bind_key(
+                        getattr(signal, "address", 0),
+                        str(getattr(signal, "register_type", "") or ""),
+                        str(getattr(signal, "data_type", "") or ""),
+                        getattr(signal, "bit_index", 0),
+                    )
+                    key_candidates = [
+                        item for item in tags_by_key.get(bind_key, []) if str(item.get("id") or "") not in used_ids
+                    ]
+                    if len(key_candidates) == 1:
+                        candidate = key_candidates[0]
+
+                if candidate is None:
+                    continue
+
+                repaired_id = str(candidate.get("id") or "").strip()
+                if not repaired_id:
+                    continue
+                if repaired_id == current_remote_id:
+                    continue
+                signal.remote_tag_id = repaired_id
+                used_ids.add(repaired_id)
+                repaired_for_source[signal_id] = repaired_id
+                repaired_total += 1
+
+            if repaired_for_source:
+                self._apply_runtime_remote_tag_id_repairs(source_id, repaired_for_source)
+
+        if repaired_total > 0:
+            self._mark_config_dirty()
+        return repaired_total
 
     def _bootstrap_remote_live_cursors(self) -> None:
         self._remote_live_cursors = {}
@@ -7591,8 +8298,12 @@ class MainWindow(QMainWindow):
             payload_ok = bool(isinstance(payload, dict) and payload.get("ok", False))
 
             if request_ok and payload_ok:
-                any_ok_now = True
-                self._remote_last_ok_mono[source_id] = now_mono
+                payload_connected = bool(payload.get("connected", True))
+                if payload_connected:
+                    any_ok_now = True
+                    self._remote_last_ok_mono[source_id] = now_mono
+                else:
+                    self._remote_last_ok_mono.pop(source_id, None)
                 self._remote_live_fail_count[source_id] = 0
                 self._remote_live_backoff_until_mono[source_id] = now_mono
 
@@ -7647,10 +8358,41 @@ class MainWindow(QMainWindow):
         end_ts = time.time()
         start_ts = max(0.0, end_ts - float(span_s))
         loaded_any = False
+
+        def _rows_from_history_payload(payload_obj: dict, tag_name_by_id: dict[str, str] | None = None) -> list[dict]:
+            samples_obj = payload_obj.get("samples")
+            if not isinstance(samples_obj, dict):
+                return []
+            rows_local: list[dict] = []
+            for remote_tag_id, points in samples_obj.items():
+                if not isinstance(points, list):
+                    continue
+                tag_id = str(remote_tag_id)
+                tag_name = ""
+                if isinstance(tag_name_by_id, dict):
+                    tag_name = str(tag_name_by_id.get(tag_id, "") or "")
+                for point in points:
+                    if not isinstance(point, (list, tuple)) or len(point) < 2:
+                        continue
+                    rows_local.append(
+                        {
+                            "tag_id": tag_id,
+                            "tag_name": tag_name,
+                            "ts": point[0],
+                            "value": point[1],
+                        }
+                    )
+            rows_local.sort(key=lambda item: float(item.get("ts", 0.0)))
+            return rows_local
+
         for source_id, tags_map in mapping.items():
             source = by_id.get(source_id)
             if source is None:
                 continue
+            timeout_s = max(0.6, min(1.2, self._remote_live_timeout_s() * 2.0))
+            tag_ids_csv = ",".join(tags_map.keys())
+            rows: list[dict] = []
+
             try:
                 payload = self._source_request_json(
                     source,
@@ -7659,32 +8401,100 @@ class MainWindow(QMainWindow):
                     query={
                         "from_ts": f"{start_ts:.3f}",
                         "to_ts": f"{end_ts:.3f}",
-                        "tag_ids": ",".join(tags_map.keys()),
+                        "tag_ids": tag_ids_csv,
                     },
-                    timeout_s=max(0.6, min(1.2, self._remote_live_timeout_s() * 2.0)),
+                    timeout_s=timeout_s,
                 )
             except Exception:
-                continue
-            if not bool(payload.get("ok", False)):
-                continue
-            samples_obj = payload.get("samples")
-            if not isinstance(samples_obj, dict):
-                continue
-            rows: list[dict] = []
-            for remote_tag_id, points in samples_obj.items():
-                if not isinstance(points, list):
-                    continue
-                for point in points:
-                    if not isinstance(point, (list, tuple)) or len(point) < 2:
-                        continue
-                    rows.append(
-                        {
-                            "tag_id": str(remote_tag_id),
-                            "ts": point[0],
-                            "value": point[1],
-                        }
+                payload = {}
+            if bool(payload.get("ok", False)):
+                rows = _rows_from_history_payload(payload)
+
+            # Fallback 1: id drift between configured tags and archived rows.
+            if not rows:
+                tag_name_by_id: dict[str, str] = {}
+                try:
+                    tags_payload = self._source_request_json(source, "GET", "/v1/tags", timeout_s=timeout_s)
+                    if bool(tags_payload.get("ok", False)):
+                        tags_raw = tags_payload.get("tags")
+                        if isinstance(tags_raw, list):
+                            for item in tags_raw:
+                                if not isinstance(item, dict):
+                                    continue
+                                rid = str(item.get("id") or "").strip()
+                                if rid:
+                                    tag_name_by_id[rid] = str(item.get("name") or rid)
+                except Exception:
+                    pass
+
+                try:
+                    payload_all = self._source_request_json(
+                        source,
+                        "GET",
+                        "/v1/history",
+                        query={
+                            "from_ts": f"{start_ts:.3f}",
+                            "to_ts": f"{end_ts:.3f}",
+                        },
+                        timeout_s=timeout_s,
                     )
-            rows.sort(key=lambda item: float(item.get("ts", 0.0)))
+                except Exception:
+                    payload_all = {}
+                if bool(payload_all.get("ok", False)):
+                    rows = _rows_from_history_payload(payload_all, tag_name_by_id=tag_name_by_id)
+
+            # Fallback 2: recorder disconnected now, but archive has old data.
+            # Use tail of /v1/live by row-id, independent of wall-clock range.
+            if not rows:
+                try:
+                    bootstrap_payload = self._source_request_json(
+                        source,
+                        "GET",
+                        "/v1/live",
+                        query={"bootstrap": 1},
+                        timeout_s=timeout_s,
+                    )
+                except Exception:
+                    bootstrap_payload = {}
+                next_sample_id = 0
+                if bool(bootstrap_payload.get("ok", False)):
+                    try:
+                        next_sample_id = int(bootstrap_payload.get("next_sample_id", 0) or 0)
+                    except (TypeError, ValueError):
+                        next_sample_id = 0
+                if next_sample_id > 0:
+                    tail_since = max(0, int(next_sample_id) - 6000)
+                    try:
+                        tail_payload = self._source_request_json(
+                            source,
+                            "GET",
+                            "/v1/live",
+                            query={
+                                "since_sample_id": int(tail_since),
+                                "since_event_id": 0,
+                                "sample_limit": 6000,
+                                "event_limit": 1,
+                            },
+                            timeout_s=timeout_s,
+                        )
+                    except Exception:
+                        tail_payload = {}
+                    if bool(tail_payload.get("ok", False)):
+                        tail_samples = tail_payload.get("samples")
+                        if isinstance(tail_samples, list):
+                            for item in tail_samples:
+                                if not isinstance(item, dict):
+                                    continue
+                                rows.append(
+                                    {
+                                        "tag_id": str(item.get("tag_id") or item.get("signal_id") or ""),
+                                        "tag_name": str(item.get("tag_name") or ""),
+                                        "ts": item.get("ts"),
+                                        "value": item.get("value"),
+                                    }
+                                )
+                            rows.sort(key=lambda item: float(item.get("ts", 0.0)))
+
             if rows:
                 self._append_remote_samples_rows(source, rows, tags_map)
                 loaded_any = True
@@ -7751,9 +8561,12 @@ class MainWindow(QMainWindow):
             self._runtime_connected = state_b
 
     def _append_ui_heartbeat_if_needed(self, connected_now: bool) -> None:
-        if not connected_now:
-            return
+        # Keep the chart timeline moving in online mode even when
+        # data arrive sparsely ("archive by changes") or connection state
+        # flaps briefly. Connectivity is still reflected via connection_events.
         if not bool(self.current_profile.render_chart_enabled):
+            return
+        if not self._is_auto_x_enabled():
             return
         if self._live_cycle_has_new_samples:
             return
@@ -7882,12 +8695,37 @@ class MainWindow(QMainWindow):
         if apply_profile:
             self._apply_current_profile(restart_live=False, history_span_s=history_span_s)
 
+        if should_force_auto_x_on_start(self._is_auto_x_enabled()):
+            self.chart.set_auto_x(True)
+            if hasattr(self, "action_auto_x"):
+                self.action_auto_x.blockSignals(True)
+                self.action_auto_x.setChecked(True)
+                self.action_auto_x.blockSignals(False)
+            if hasattr(self, "values_auto_x_checkbox"):
+                self.values_auto_x_checkbox.blockSignals(True)
+                self.values_auto_x_checkbox.setChecked(True)
+                self.values_auto_x_checkbox.blockSignals(False)
+
         if self._is_live_stream_running():
             return
 
         self._last_live_values = {}
         self._live_cycle_has_new_samples = False
         self._last_ui_heartbeat_ts = 0.0
+
+        auto_applied_remote, auto_failed_remote = self._auto_sync_remote_profiles_for_live()
+        if auto_applied_remote > 0:
+            self.status_label.setText(
+                f"Статус: синхронизация удалённых источников выполнена ({auto_applied_remote})"
+            )
+        elif auto_failed_remote > 0:
+            self.status_label.setText(
+                f"Статус: часть удалённых источников не синхронизирована ({auto_failed_remote})"
+            )
+
+        # Try to repair missing/invalid remote tag bindings before live start,
+        # so all rows can receive updates even after config edits/import drifts.
+        self._try_repair_remote_bindings()
 
         needs_local_stream = any(
             str(getattr(signal, "source_id", "local") or "local") == "local" for signal in self.current_profile.signals
@@ -7940,7 +8778,7 @@ class MainWindow(QMainWindow):
                 span_s = 120.0
             self._load_recent_remote_history_from_sources(span_s)
         elif bool(self.current_profile.render_chart_enabled):
-            self._load_recent_remote_history_from_sources(120.0)
+            self._load_recent_remote_history_from_sources(max(10.0, float(history_span_s or 120.0)))
         if not restored:
             self._connection_events = []
             self._last_connection_state = None
@@ -8006,6 +8844,7 @@ class MainWindow(QMainWindow):
         self.action_stop.setEnabled(False)
         self._runtime_connected = False
         self._update_runtime_status_panel()
+        self._reset_history_window_cache()
         self._update_recorder_dependent_ui_state()
         self.status_label.setText('Статус: остановлено')
 
@@ -8034,6 +8873,7 @@ class MainWindow(QMainWindow):
             self.action_stop.setEnabled(True)
 
     def _on_chart_auto_mode_changed(self, auto_x: bool, auto_y: bool) -> None:
+        prev_auto_x = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else bool(auto_x)
         self.action_auto_x.blockSignals(True)
         self.action_auto_x.setChecked(auto_x)
         self.action_auto_x.blockSignals(False)
@@ -8041,6 +8881,15 @@ class MainWindow(QMainWindow):
             self.values_auto_x_checkbox.blockSignals(True)
             self.values_auto_x_checkbox.setChecked(bool(auto_x))
             self.values_auto_x_checkbox.blockSignals(False)
+        if prev_auto_x != bool(auto_x):
+            mode = str(self.mode_combo.currentData() or "online")
+            if mode == "online" and bool(self.current_profile.render_chart_enabled):
+                if bool(auto_x):
+                    self._pending_render_samples = []
+                    self._load_recent_online_history_from_db(adjust_x_range=True, silent=True)
+                    self._reset_history_window_cache()
+                else:
+                    self._schedule_visible_history_reload(force=False)
         self._mark_config_dirty()
 
     def _on_chart_cursor_enabled_changed(self, enabled: bool) -> None:
@@ -8162,7 +9011,8 @@ class MainWindow(QMainWindow):
 
     def _update_values_table(self, rows: list[dict], _cursor_visible: bool) -> None:
         self._last_values_rows = list(rows)
-        sorted_rows = self._sorted_values_rows(list(rows))
+        active_rows = [row for row in list(rows) if bool(row.get("enabled", True))]
+        sorted_rows = self._sorted_values_rows(active_rows)
         signal_source_by_id: dict[str, str] = {}
         for signal in getattr(self.current_profile, "signals", []):
             signal_source_by_id[str(getattr(signal, "id", ""))] = str(getattr(signal, "source_id", "local") or "local")
@@ -8403,7 +9253,9 @@ class MainWindow(QMainWindow):
                 break
         if persisted_profile is None:
             return True
-        if persisted_profile.to_dict() != self.current_profile.to_dict():
+        if self._normalize_profile_payload_for_dirty_check(
+            persisted_profile.to_dict()
+        ) != self._normalize_profile_payload_for_dirty_check(self.current_profile.to_dict()):
             return True
         if str(persisted.active_profile_id or "") != str(self.current_profile.id):
             return True
@@ -8414,6 +9266,35 @@ class MainWindow(QMainWindow):
         if bool(persisted.auto_connect_on_launch) != bool(self.app_config.auto_connect_on_launch):
             return True
         return False
+
+    def _normalize_profile_payload_for_dirty_check(self, payload: dict) -> dict:
+        normalized = copy.deepcopy(payload if isinstance(payload, dict) else {})
+        ui_state = normalized.get("ui_state")
+        if not isinstance(ui_state, dict):
+            return normalized
+
+        view = ui_state.get("view")
+        if not isinstance(view, dict):
+            return normalized
+
+        if bool(view.get("auto_x", True)):
+            # In Auto X mode range continuously moves and should not mark config as dirty.
+            view.pop("x_range", None)
+
+        scale_states = view.get("scale_states")
+        if isinstance(scale_states, list):
+            rows: list[dict] = []
+            for row in scale_states:
+                if not isinstance(row, dict):
+                    continue
+                item = dict(row)
+                if bool(item.get("auto_y", True)):
+                    # In Auto Y mode current min/max are runtime values.
+                    item.pop("y_min", None)
+                    item.pop("y_max", None)
+                rows.append(item)
+            view["scale_states"] = rows
+        return normalized
 
     def _resolve_exit_save_policy(self) -> str:
         if not self._has_unsaved_config_changes():

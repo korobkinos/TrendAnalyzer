@@ -10,6 +10,7 @@ fi
 
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt -r requirements-build.txt
+.venv/bin/python scripts/preflight_check.py
 
 # 1) Client UI
 .venv/bin/python -m PyInstaller \
