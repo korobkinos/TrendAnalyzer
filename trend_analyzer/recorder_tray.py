@@ -8,9 +8,10 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QCoreApplication, QObject, QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -123,9 +124,12 @@ class RecorderTrayController(QObject):
         self._action_start: QAction | None = None
         self._action_stop: QAction | None = None
         self._action_autostart: QAction | None = None
+        self._shutting_down = False
+        self._cleanup_helper_spawned = False
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(2000)
         self._status_timer.timeout.connect(self._refresh_status_ui)
+        self._app.aboutToQuit.connect(self._on_about_to_quit)
         self._init_tray()
         self._status_timer.start()
         QTimer.singleShot(250, self._on_started)
@@ -377,41 +381,225 @@ class RecorderTrayController(QObject):
             )
         return False
 
-    def _stop_recorder(self, _checked: bool = False) -> None:
-        pid = resolve_recorder_pid()
-        if pid is None:
-            clear_recorder_pid()
-            self._refresh_status_ui()
-            return
-
-        try:
-            request_recorder_stop()
-        except Exception as exc:
-            QMessageBox.warning(None, APP_NAME, f"Ошибка отправки команды остановки: {exc}")
-            self._refresh_status_ui()
-            return
-
-        deadline = time.monotonic() + 6.0
-        while time.monotonic() < deadline:
-            QApplication.processEvents()
-            if resolve_recorder_pid() is None:
-                clear_recorder_pid()
-                self._refresh_status_ui()
-                return
-            time.sleep(0.2)
-
+    def _terminate_recorder_pid(self, pid: int, silent: bool = False) -> bool:
         try:
             if sys.platform == "win32":
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False, capture_output=True)
             else:
                 os.kill(int(pid), signal.SIGTERM)
         except Exception as exc:
-            QMessageBox.warning(None, APP_NAME, f"Ошибка принудительной остановки: {exc}")
+            if not silent:
+                QMessageBox.warning(None, APP_NAME, f"Ошибка принудительной остановки: {exc}")
             self._refresh_status_ui()
-            return
+            return False
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            QApplication.processEvents()
+            if resolve_recorder_pid() is None:
+                clear_recorder_pid()
+                self._refresh_status_ui()
+                return True
+            time.sleep(0.15)
 
         clear_recorder_pid()
         self._refresh_status_ui()
+        return resolve_recorder_pid() is None
+
+    def _iter_residual_recorder_pids(self) -> list[int]:
+        if psutil is None:
+            return []
+        current_pid = int(os.getpid())
+        current_exe = ""
+        current_name = ""
+        try:
+            current_exe = str(Path(sys.executable).resolve()).strip().lower()
+        except Exception:
+            current_exe = ""
+        try:
+            current_name = str(Path(sys.executable).name).strip().lower()
+        except Exception:
+            current_name = "trendrecorder.exe"
+
+        result: list[int] = []
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "exe"]):
+            try:
+                info = proc.info
+                pid = int(info.get("pid") or 0)
+                if pid <= 0 or pid == current_pid:
+                    continue
+                name = str(info.get("name") or "").strip().lower()
+                exe = str(info.get("exe") or "").strip().lower()
+                cmdline = [str(part).strip().lower() for part in (info.get("cmdline") or [])]
+            except Exception:
+                continue
+            if "--recorder" not in cmdline:
+                continue
+            same_exe = bool(current_exe) and bool(exe) and exe == current_exe
+            same_name = bool(current_name) and name == current_name
+            if same_exe or same_name or "trendrecorder.exe" in name:
+                result.append(pid)
+        return sorted(set(result))
+
+    def _iter_bootstrap_parent_pids(self) -> list[int]:
+        if psutil is None:
+            return []
+        current_pid = int(os.getpid())
+        current_exe = ""
+        current_name = ""
+        try:
+            current_exe = str(Path(sys.executable).resolve()).strip().lower()
+        except Exception:
+            current_exe = ""
+        try:
+            current_name = str(Path(sys.executable).name).strip().lower()
+        except Exception:
+            current_name = "trendrecorder.exe"
+
+        result: list[int] = []
+        try:
+            proc = psutil.Process(current_pid)
+        except Exception:
+            return result
+
+        try:
+            parents = proc.parents()
+        except Exception:
+            parents = []
+        for parent in parents:
+            try:
+                pid = int(parent.pid)
+                if pid <= 0 or pid == current_pid:
+                    continue
+                name = str(parent.name() or "").strip().lower()
+                exe = str(parent.exe() or "").strip().lower()
+            except Exception:
+                continue
+            same_exe = bool(current_exe) and bool(exe) and exe == current_exe
+            same_name = bool(current_name) and name == current_name
+            if same_exe or same_name or "trendrecorder.exe" in name:
+                result.append(pid)
+        return sorted(set(result))
+
+    def _terminate_processes(self, pids: list[int]) -> bool:
+        pending = [int(pid) for pid in list(pids or []) if int(pid) > 0]
+        if not pending:
+            return True
+        for pid in pending:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False, capture_output=True)
+                else:
+                    os.kill(int(pid), signal.SIGTERM)
+            except Exception:
+                continue
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            remaining = [pid for pid in pending if is_recorder_pid_running(pid) or (psutil is not None and psutil.pid_exists(pid))]
+            if not remaining:
+                return True
+            time.sleep(0.15)
+        return False
+
+    def _terminate_residual_recorder_processes(self) -> bool:
+        return self._terminate_processes(self._iter_residual_recorder_pids())
+
+    def _spawn_windows_cleanup_helper(self, *, kill_all_same_exe: bool) -> None:
+        if sys.platform != "win32":
+            return
+        if not getattr(sys, "frozen", False):
+            return
+        if self._cleanup_helper_spawned and kill_all_same_exe:
+            return
+        exe_path = ""
+        try:
+            exe_path = str(Path(sys.executable).resolve())
+        except Exception:
+            return
+        if not exe_path:
+            return
+
+        exe_name = ""
+        try:
+            exe_name = str(Path(exe_path).name).strip()
+        except Exception:
+            exe_name = "TrendRecorder.exe"
+        if kill_all_same_exe:
+            helper_cmd = f"timeout /t 3 /nobreak >nul & taskkill /IM \"{exe_name}\" /F >nul 2>&1"
+        else:
+            exe_path_ps = exe_path.replace("'", "''")
+            filter_expr = (
+                "$_.ExecutablePath -and ([string]$_.ExecutablePath).ToLower() -eq $exe.ToLower() "
+                "-and ([string]$_.Name).ToLower() -eq 'trendrecorder.exe' "
+                "-and ([string]$_.CommandLine).ToLower().Contains('--recorder')"
+            )
+            helper_cmd = (
+                "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "
+                "\""
+                f"$exe = '{exe_path_ps}'; "
+                "Start-Sleep -Milliseconds 2200; "
+                f"Get-CimInstance Win32_Process | Where-Object {{ {filter_expr} }} | "
+                "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }"
+                "\""
+            )
+        kwargs: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        try:
+            subprocess.Popen(
+                [
+                    "cmd.exe",
+                    "/d",
+                    "/c",
+                    helper_cmd,
+                ],
+                **kwargs,
+            )
+            if kill_all_same_exe:
+                self._cleanup_helper_spawned = True
+        except Exception:
+            pass
+
+    def _stop_recorder(self, _checked: bool = False, silent: bool = False) -> bool:
+        pid = resolve_recorder_pid()
+        if pid is None:
+            clear_recorder_pid()
+            self._terminate_residual_recorder_processes()
+            self._spawn_windows_cleanup_helper(kill_all_same_exe=False)
+            self._refresh_status_ui()
+            return True
+
+        try:
+            request_recorder_stop()
+        except Exception as exc:
+            if not silent:
+                QMessageBox.warning(None, APP_NAME, f"Ошибка отправки команды остановки: {exc}")
+            self._refresh_status_ui()
+            return False
+
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            QApplication.processEvents()
+            if resolve_recorder_pid() is None:
+                clear_recorder_pid()
+                self._terminate_residual_recorder_processes()
+                self._spawn_windows_cleanup_helper(kill_all_same_exe=False)
+                self._refresh_status_ui()
+                return True
+            time.sleep(0.2)
+
+        stopped = self._terminate_recorder_pid(int(pid), silent=silent)
+        residual_cleared = self._terminate_residual_recorder_processes()
+        self._spawn_windows_cleanup_helper(kill_all_same_exe=False)
+        return bool(stopped and residual_cleared)
 
     def _show_status_dialog(self, _checked: bool = False) -> None:
         payload = read_recorder_status() or {}
@@ -488,10 +676,68 @@ class RecorderTrayController(QObject):
         else:
             self._tray_icon.setToolTip(f"{APP_NAME}: recorder не запущен")
 
-    def _exit_tray(self) -> None:
+    def _shutdown(self, stop_recorder: bool) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        try:
+            if self._status_timer.isActive():
+                self._status_timer.stop()
+        except Exception:
+            pass
+        if stop_recorder:
+            try:
+                self._stop_recorder(silent=True)
+            except Exception:
+                pass
         if self._tray_icon is not None:
-            self._tray_icon.hide()
-        self._app.quit()
+            try:
+                self._tray_icon.hide()
+                self._tray_icon.setContextMenu(None)
+                self._tray_icon.deleteLater()
+            except Exception:
+                pass
+            self._tray_icon = None
+
+    def _on_about_to_quit(self) -> None:
+        self._shutdown(stop_recorder=False)
+
+    def _exit_tray(self) -> None:
+        def _hard_exit() -> None:
+            try:
+                self._terminate_residual_recorder_processes()
+            except Exception:
+                pass
+            try:
+                self._terminate_processes(self._iter_bootstrap_parent_pids())
+            except Exception:
+                pass
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+
+        fallback = threading.Timer(1.5, _hard_exit)
+        fallback.daemon = True
+        fallback.start()
+        self._spawn_windows_cleanup_helper(kill_all_same_exe=True)
+        self._shutdown(stop_recorder=True)
+        try:
+            self._terminate_residual_recorder_processes()
+        except Exception:
+            pass
+        try:
+            self._app.exit(0)
+        except Exception:
+            pass
+        try:
+            self._app.quit()
+        except Exception:
+            pass
+        try:
+            QCoreApplication.quit()
+        except Exception:
+            pass
 
 
 def run_recorder_tray() -> None:
@@ -521,8 +767,22 @@ def run_recorder_tray() -> None:
         controller = RecorderTrayController(app)
     except Exception as exc:
         QMessageBox.critical(None, APP_NAME, f"Не удалось запустить tray-регистратор: {exc}")
+        try:
+            instance_lock.release()
+        except Exception:
+            pass
         return
 
     # Keep strong reference for the app lifetime.
     app._recorder_tray_controller = controller  # type: ignore[attr-defined]
-    app.exec()
+    try:
+        app.exec()
+    finally:
+        try:
+            controller._shutdown(stop_recorder=False)
+        except Exception:
+            pass
+        try:
+            instance_lock.release()
+        except Exception:
+            pass

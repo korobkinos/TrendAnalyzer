@@ -47,16 +47,7 @@ Invoke-Step "Build TrendClient.exe" {
   .\.venv\Scripts\python.exe -m PyInstaller `
     --noconfirm `
     --clean `
-    --windowed `
-    --onefile `
-    --name TrendClient `
-    --icon assets\app_icon.ico `
-    --add-data "assets\app_icon.ico;assets" `
-    --collect-all pyqtgraph `
-    --hidden-import PySide6.QtSvg `
-    --hidden-import PySide6.QtOpenGLWidgets `
-    --hidden-import PySide6.QtPrintSupport `
-    client_main.py
+    TrendClient.spec
 }
 
 Invoke-Step "Build TrendRecorder.exe" {

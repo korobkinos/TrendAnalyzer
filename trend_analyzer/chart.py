@@ -122,10 +122,13 @@ class MultiAxisChart(QWidget):
         self.plot_item.vb.sigRangeChangedManually.connect(self._on_main_range_changed_manually)
         self.plot_widget.viewport().installEventFilter(self)
 
+        self._live_buffers: dict[str, tuple[list[float], list[float]]] = {}
+        self._history_buffers: dict[str, tuple[list[float], list[float]]] = {}
         self._buffers: dict[str, tuple[list[float], list[float]]] = {}
         self._meta: dict[str, dict] = {}
         self._curves: dict[str, pg.PlotCurveItem] = {}
         self._signal_order: list[str] = []
+        self._hidden_curve_cleared: set[str] = set()
 
         self._axis_views: dict[int, pg.ViewBox] = {}
         self._axis_items: dict[int, pg.AxisItem] = {}
@@ -134,11 +137,17 @@ class MultiAxisChart(QWidget):
 
         self._main_axis_index: int = 1
 
-        self._max_points = 4000
+        self._max_points = 8000
         self._max_render_points = 2500
+        self._min_render_points = 900
+        self._max_detail_render_points = 18000
+        self._max_total_render_points = 90000
         self._render_margin_ratio = 0.15
+        self._curve_smoothing_enabled = False
+        self._curve_smoothing_window = 5
         self._last_sample_ts: float | None = None
         self._auto_x = True
+        self._soft_follow_latest_x = False
         self._auto_y = True
         self._applying_auto_range = False
         self._cursor_ratio: float | None = None
@@ -372,6 +381,69 @@ class MultiAxisChart(QWidget):
         if keep_from > 0:
             self._connection_events = self._connection_events[keep_from:]
 
+    @staticmethod
+    def _merge_series(
+        history_pair: tuple[list[float], list[float]],
+        live_pair: tuple[list[float], list[float]],
+    ) -> tuple[list[float], list[float]]:
+        hx, hy = history_pair
+        lx, ly = live_pair
+        if not hx:
+            return list(lx), list(ly)
+        if not lx:
+            return list(hx), list(hy)
+
+        out_xs: list[float] = []
+        out_ys: list[float] = []
+        i = 0
+        j = 0
+        while i < len(hx) and j < len(lx):
+            hxv = float(hx[i])
+            lxv = float(lx[j])
+            if abs(hxv - lxv) <= 1e-9:
+                out_xs.append(lxv)
+                out_ys.append(float(ly[j]))
+                i += 1
+                j += 1
+                continue
+            if hxv < lxv:
+                out_xs.append(hxv)
+                out_ys.append(float(hy[i]))
+                i += 1
+            else:
+                out_xs.append(lxv)
+                out_ys.append(float(ly[j]))
+                j += 1
+
+        while i < len(hx):
+            out_xs.append(float(hx[i]))
+            out_ys.append(float(hy[i]))
+            i += 1
+        while j < len(lx):
+            out_xs.append(float(lx[j]))
+            out_ys.append(float(ly[j]))
+            j += 1
+        return out_xs, out_ys
+
+    def _refresh_signal_buffer(self, signal_id: str) -> None:
+        live_pair = self._live_buffers.get(signal_id, ([], []))
+        history_pair = self._history_buffers.get(signal_id, ([], []))
+        self._buffers[signal_id] = self._merge_series(history_pair, live_pair)
+
+    def _refresh_all_buffers(self) -> None:
+        for signal_id in list(self._signal_order):
+            self._refresh_signal_buffer(signal_id)
+
+    def _recompute_last_sample_ts(self) -> None:
+        last_ts: float | None = None
+        for xs, _ys in self._buffers.values():
+            if not xs:
+                continue
+            candidate = float(xs[-1])
+            if last_ts is None or candidate > last_ts:
+                last_ts = candidate
+        self._last_sample_ts = last_ts
+
     def _axis_y_range(self, axis_index: int) -> tuple[float, float]:
         view = self._view_for_axis(axis_index)
         if view is None:
@@ -380,6 +452,8 @@ class MultiAxisChart(QWidget):
         return float(yr[0]), float(yr[1])
 
     def configure_signals(self, signals: list[SignalConfig]) -> None:
+        old_live_buffers = self._live_buffers
+        old_history_buffers = self._history_buffers
         old_buffers = self._buffers
         old_axis_auto = dict(self._axis_auto_y)
 
@@ -397,8 +471,11 @@ class MultiAxisChart(QWidget):
         self._curves.clear()
         self._axis_signals.clear()
         self._axis_auto_y.clear()
+        self._live_buffers = {}
+        self._history_buffers = {}
         self._buffers = {}
         self._signal_order = []
+        self._hidden_curve_cleared = set()
 
         if self.legend.scene() is not None:
             self.legend.scene().removeItem(self.legend)
@@ -479,8 +556,12 @@ class MultiAxisChart(QWidget):
                 "unit": signal.unit,
                 "enabled": signal.enabled,
                 "axis_index": axis_index,
+                "data_type": str(getattr(signal, "data_type", "") or ""),
             }
-            self._buffers[signal.id] = old_buffers.get(signal.id, ([], []))
+            self._live_buffers[signal.id] = old_live_buffers.get(signal.id, old_buffers.get(signal.id, ([], [])))
+            self._history_buffers[signal.id] = old_history_buffers.get(signal.id, ([], []))
+            self._buffers[signal.id] = ([], [])
+            self._refresh_signal_buffer(signal.id)
 
             curve = pg.PlotCurveItem(pen=pg.mkPen(signal.color, width=2), name=signal.name)
             curve.setVisible(signal.enabled)
@@ -500,6 +581,7 @@ class MultiAxisChart(QWidget):
         for axis_index in axis_indexes:
             self._axis_auto_y.setdefault(axis_index, old_axis_auto.get(axis_index, self._auto_y))
 
+        self._recompute_last_sample_ts()
         self._sync_views()
         self.set_visual_settings()
         self._redraw_all()
@@ -519,10 +601,10 @@ class MultiAxisChart(QWidget):
             sample_changed = False
             sample_last_ts: float | None = None
             for signal_id, (_signal_name, value) in samples.items():
-                if signal_id not in self._buffers:
+                if signal_id not in self._live_buffers:
                     continue
 
-                xs, ys = self._buffers[signal_id]
+                xs, ys = self._live_buffers[signal_id]
                 # Guard against out-of-order timestamps from mixed sources/heartbeat:
                 # keep X monotonic for each signal so auto-scroll never "jumps back".
                 ts_plot = ts_f
@@ -535,6 +617,7 @@ class MultiAxisChart(QWidget):
                 if len(xs) > self._max_points:
                     xs.pop(0)
                     ys.pop(0)
+                self._refresh_signal_buffer(signal_id)
                 sample_changed = True
                 if sample_last_ts is None or ts_plot > sample_last_ts:
                     sample_last_ts = ts_plot
@@ -556,9 +639,10 @@ class MultiAxisChart(QWidget):
         self._redraw_all()
         if self._connection_events and not self._connection_events[-1][1]:
             self._render_connection_overlay()
-        if self._auto_x and last_ts is not None:
+        follow_latest_x = self._follows_latest_x()
+        if follow_latest_x and last_ts is not None:
             self._scroll_x_to_latest(last_ts)
-        if self.cursor_line.isVisible() and self._auto_x:
+        if self.cursor_line.isVisible() and follow_latest_x:
             self._place_cursor_by_ratio()
         self._update_cursor_values()
         self._emit_display_rows()
@@ -566,6 +650,10 @@ class MultiAxisChart(QWidget):
             self._emit_scales_changed()
 
     def clear_data(self) -> None:
+        for signal_id in list(self._live_buffers.keys()):
+            self._live_buffers[signal_id] = ([], [])
+        for signal_id in list(self._history_buffers.keys()):
+            self._history_buffers[signal_id] = ([], [])
         for signal_id in list(self._buffers.keys()):
             self._buffers[signal_id] = ([], [])
         self._last_sample_ts = None
@@ -577,7 +665,7 @@ class MultiAxisChart(QWidget):
         self._emit_display_rows()
 
     def set_archive_data(self, payload: dict[str, list[list[float]]]) -> None:
-        for signal_id in list(self._buffers.keys()):
+        for signal_id in list(self._history_buffers.keys()):
             raw_points = payload.get(signal_id) or []
             xs: list[float] = []
             ys: list[float] = []
@@ -589,16 +677,10 @@ class MultiAxisChart(QWidget):
                     ys.append(float(point[1]))
                 except (TypeError, ValueError):
                     continue
-            self._buffers[signal_id] = (xs, ys)
+            self._history_buffers[signal_id] = (xs, ys)
+            self._refresh_signal_buffer(signal_id)
 
-        last_ts: float | None = None
-        for xs, _ys in self._buffers.values():
-            if xs:
-                candidate = xs[-1]
-                if last_ts is None or candidate > last_ts:
-                    last_ts = candidate
-
-        self._last_sample_ts = last_ts
+        self._recompute_last_sample_ts()
         self._prune_connection_events_to_data_window()
         self._redraw_all()
         self._apply_auto_range()
@@ -651,9 +733,26 @@ class MultiAxisChart(QWidget):
 
     def set_auto_x(self, enabled: bool) -> None:
         self._auto_x = bool(enabled)
-        if self._auto_x and self._last_sample_ts is not None:
+        # When Auto X is unchecked, keep following the latest edge until the
+        # user actually changes X manually. This prevents an immediate "freeze"
+        # impression right after toggling the option off.
+        self._soft_follow_latest_x = not self._auto_x
+        if self._follows_latest_x() and self._last_sample_ts is not None:
             self._scroll_x_to_latest(self._last_sample_ts)
         self._apply_auto_range()
+        self._emit_scales_changed()
+
+    def _follows_latest_x(self) -> bool:
+        return bool(self._auto_x or self._soft_follow_latest_x)
+
+    def follows_latest_x(self) -> bool:
+        return self._follows_latest_x()
+
+    def force_manual_x(self) -> None:
+        self._auto_x = False
+        self._soft_follow_latest_x = False
+        self._apply_auto_range()
+        self._emit_scales_changed()
 
     def set_auto_y(self, enabled: bool) -> None:
         self._auto_y = bool(enabled)
@@ -829,8 +928,7 @@ class MultiAxisChart(QWidget):
         curve = self._curves.get(signal_id)
         if curve is not None:
             curve.setVisible(new_state)
-            if not new_state:
-                curve.setData([], [])
+        self._hidden_curve_cleared.discard(str(signal_id))
         self._redraw_all()
         self._emit_display_rows()
         self._emit_scales_changed()
@@ -860,8 +958,7 @@ class MultiAxisChart(QWidget):
             curve = self._curves.get(signal_id)
             if curve is not None:
                 curve.setVisible(new_state)
-                if not new_state:
-                    curve.setData([], [])
+            self._hidden_curve_cleared.discard(str(signal_id))
 
         if changed_count > 0:
             self._redraw_all()
@@ -1078,9 +1175,16 @@ class MultiAxisChart(QWidget):
             if not is_enabled:
                 # Keep data in buffers for table/cursor/history, but do not spend
                 # CPU on decimation/drawing for hidden signals.
-                curve.setData([], [])
+                if signal_id not in self._hidden_curve_cleared:
+                    curve.setData([], [])
+                    self._hidden_curve_cleared.add(signal_id)
                 continue
+            self._hidden_curve_cleared.discard(signal_id)
             draw_xs, draw_ys = self._curve_data_for_view(xs, ys, x_min, x_max)
+            if self._curve_smoothing_enabled and draw_ys:
+                data_type = str(meta.get("data_type", "") or "").strip().lower() if isinstance(meta, dict) else ""
+                if data_type != "bool":
+                    draw_ys = self._smooth_series_moving_average(draw_ys, self._curve_smoothing_window)
             curve.setData(draw_xs, draw_ys)
 
         main_signal_ids = self._axis_signals.get(self._main_axis_index, [])
@@ -1196,6 +1300,47 @@ class MultiAxisChart(QWidget):
             color = str(self.get_signal_color(signal_id))
             curve.setPen(pg.mkPen(color, width=line_w))
 
+    def set_curve_smoothing(self, enabled: bool, window: int = 5) -> None:
+        smooth_enabled = bool(enabled)
+        try:
+            smooth_window = int(window)
+        except (TypeError, ValueError):
+            smooth_window = 5
+        smooth_window = max(3, min(31, smooth_window))
+        if smooth_window % 2 == 0:
+            smooth_window = smooth_window + 1 if smooth_window < 31 else smooth_window - 1
+
+        changed = (
+            smooth_enabled != self._curve_smoothing_enabled
+            or smooth_window != self._curve_smoothing_window
+        )
+        self._curve_smoothing_enabled = smooth_enabled
+        self._curve_smoothing_window = smooth_window
+        if changed:
+            self._redraw_all()
+
+    @staticmethod
+    def _smooth_series_moving_average(values: list[float], window: int) -> list[float]:
+        count = len(values)
+        if count <= 2:
+            return values
+        win = max(3, int(window))
+        if win % 2 == 0:
+            win += 1
+        half = win // 2
+
+        prefix: list[float] = [0.0] * (count + 1)
+        for idx, value in enumerate(values, start=1):
+            prefix[idx] = prefix[idx - 1] + float(value)
+
+        smoothed: list[float] = [0.0] * count
+        for idx in range(count):
+            left = max(0, idx - half)
+            right = min(count, idx + half + 1)
+            span = max(1, right - left)
+            smoothed[idx] = (prefix[right] - prefix[left]) / float(span)
+        return smoothed
+
     def _apply_grid_pen_color(self) -> None:
         grid_pen = pg.mkPen(self._grid_color)
         left_axis = self.plot_item.getAxis("left")
@@ -1237,24 +1382,70 @@ class MultiAxisChart(QWidget):
     ) -> tuple[list[float], list[float]]:
         if not xs:
             return xs, ys
-        if len(xs) <= self._max_render_points:
+        render_points = self._render_points_for_view(x_min, x_max)
+        if len(xs) <= render_points:
             return xs, ys
         if x_max <= x_min:
-            return self._decimate_series(xs, ys, self._max_render_points)
+            return self._decimate_series(xs, ys, render_points)
 
-        span = x_max - x_min
-        margin = max(0.1, span * self._render_margin_ratio)
-        left_bound = x_min - margin
-        right_bound = x_max + margin
-        left_idx = max(0, bisect.bisect_left(xs, left_bound) - 1)
-        right_idx = min(len(xs), bisect.bisect_right(xs, right_bound) + 1)
+        left_idx, right_idx = self._visible_slice_bounds(xs, x_min, x_max)
 
         if right_idx - left_idx <= 0:
             return [], []
 
         sub_xs = xs[left_idx:right_idx]
         sub_ys = ys[left_idx:right_idx]
-        return self._decimate_series(sub_xs, sub_ys, self._max_render_points)
+        if len(sub_xs) <= render_points:
+            return sub_xs, sub_ys
+        return self._decimate_series(sub_xs, sub_ys, render_points)
+
+    def _enabled_signal_count(self) -> int:
+        enabled = 0
+        for signal_id in self._signal_order:
+            meta = self._meta.get(signal_id, {})
+            if bool(meta.get("enabled", True)):
+                enabled += 1
+        return max(1, enabled)
+
+    def _render_points_for_view(self, x_min: float, x_max: float) -> int:
+        try:
+            width_px = int(self.plot_widget.width())
+        except Exception:
+            width_px = 1200
+        width_px = max(320, width_px)
+
+        span = max(0.1, float(x_max) - float(x_min))
+        if span <= 5.0 * 60.0:
+            density = 8.0
+        elif span <= 30.0 * 60.0:
+            density = 4.5
+        elif span <= 2.0 * 3600.0:
+            density = 3.0
+        else:
+            density = 1.8
+
+        target = int(width_px * density)
+        target = max(self._max_render_points, target)
+        target = min(target, int(self._max_detail_render_points))
+
+        enabled = self._enabled_signal_count()
+        per_signal_cap = max(self._min_render_points, int(self._max_total_render_points / max(1, enabled)))
+        target = min(target, per_signal_cap)
+        return max(self._min_render_points, int(target))
+
+    def _visible_slice_bounds(self, xs: list[float], x_min: float, x_max: float) -> tuple[int, int]:
+        if not xs:
+            return 0, 0
+        if x_max <= x_min:
+            return 0, len(xs)
+
+        span = float(x_max) - float(x_min)
+        margin = max(0.1, span * self._render_margin_ratio)
+        left_bound = float(x_min) - margin
+        right_bound = float(x_max) + margin
+        left_idx = max(0, bisect.bisect_left(xs, left_bound) - 1)
+        right_idx = min(len(xs), bisect.bisect_right(xs, right_bound) + 1)
+        return left_idx, right_idx
 
     @staticmethod
     def _decimate_series(
@@ -1426,13 +1617,23 @@ class MultiAxisChart(QWidget):
         self._emit_display_rows()
 
     def _on_x_range_changed(self, _view_box, _new_range) -> None:
-        if any(len(xs) > self._max_render_points for xs, _ in self._buffers.values()):
+        x_min, x_max = self.current_x_range()
+        needs_redraw = False
+        for signal_id, (xs, _ys) in self._buffers.items():
+            meta = self._meta.get(signal_id)
+            if isinstance(meta, dict) and not bool(meta.get("enabled", True)):
+                continue
+            # Redraw on X-range changes whenever the series is "long enough"
+            # to be potentially decimated/subsliced.
+            if len(xs) > self._max_render_points:
+                needs_redraw = True
+                break
+        if needs_redraw:
             self._redraw_all()
         if self.cursor_line.isVisible() and self._auto_x:
             self._place_cursor_by_ratio()
             self._update_cursor_values()
         try:
-            x_min, x_max = self.current_x_range()
             self.x_range_changed.emit(float(x_min), float(x_max))
         except Exception:
             pass
@@ -1443,10 +1644,13 @@ class MultiAxisChart(QWidget):
         if self._programmatic_x_change:
             return
         affects_x = bool(len(mask) > 0 and mask[0]) if mask is not None else True
+        if affects_x and (not self._auto_x) and self._soft_follow_latest_x:
+            self._soft_follow_latest_x = False
         # Keep Auto X enabled for wheel zoom; disable for manual X pan/scroll.
         wheel_recent = (time.monotonic() - self._last_wheel_ts) <= 0.25
         if affects_x and self._auto_x and not wheel_recent:
             self._auto_x = False
+            self._soft_follow_latest_x = False
             self.auto_mode_changed.emit(self._auto_x, self._auto_y)
 
     def _on_main_y_range_changed(self, _view_box, new_range) -> None:
@@ -1502,6 +1706,8 @@ class MultiAxisChart(QWidget):
             meta = self._meta.get(signal_id)
             if not meta:
                 continue
+            if not bool(meta.get("enabled", True)):
+                continue
 
             point = (
                 self._nearest_point(signal_id, cursor_x)
@@ -1540,6 +1746,7 @@ class MultiAxisChart(QWidget):
             rows.append(
                 {
                     "axis_index": axis_index,
+                    "auto_x": bool(self._auto_x),
                     "auto_y": bool(self._axis_auto_y.get(axis_index, axis_index == self._main_axis_index and self._auto_y)),
                     "y_min": y_min,
                     "y_max": y_max,

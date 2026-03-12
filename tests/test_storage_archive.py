@@ -9,7 +9,7 @@ from trend_analyzer.storage import ArchiveStore
 
 
 class ArchiveStoreSchemaTests(unittest.TestCase):
-    def test_compact_schema_and_meta_insert(self) -> None:
+    def test_normalized_schema_and_meta_insert(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "archive.db"
             store = ArchiveStore(str(db_path))
@@ -26,16 +26,28 @@ class ArchiveStoreSchemaTests(unittest.TestCase):
 
             conn = sqlite3.connect(db_path)
             try:
-                cols = {
+                view_cols = {
                     str(row[1])
                     for row in conn.execute("PRAGMA table_info(samples)").fetchall()
                     if len(row) > 1
                 }
-                self.assertIn("profile_id", cols)
-                self.assertIn("signal_id", cols)
-                self.assertIn("ts", cols)
-                self.assertIn("value", cols)
-                self.assertNotIn("signal_name", cols)
+                self.assertIn("profile_id", view_cols)
+                self.assertIn("signal_id", view_cols)
+                self.assertIn("ts", view_cols)
+                self.assertIn("value", view_cols)
+                self.assertNotIn("signal_name", view_cols)
+
+                physical_cols = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(sample_rows)").fetchall()
+                    if len(row) > 1
+                }
+                self.assertIn("profile_ref", physical_cols)
+                self.assertIn("signal_ref", physical_cols)
+                self.assertIn("ts", physical_cols)
+                self.assertIn("value", physical_cols)
+                self.assertNotIn("profile_id", physical_cols)
+                self.assertNotIn("signal_id", physical_cols)
 
                 samples_count = int(conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
                 self.assertEqual(samples_count, 2)
@@ -154,15 +166,23 @@ class ArchiveStoreSchemaTests(unittest.TestCase):
 
             conn = sqlite3.connect(db_path)
             try:
-                cols = {
+                view_cols = {
                     str(row[1])
                     for row in conn.execute("PRAGMA table_info(samples)").fetchall()
                     if len(row) > 1
                 }
-                self.assertNotIn("signal_name", cols)
+                self.assertNotIn("signal_name", view_cols)
                 # Legacy rows are intentionally dropped: app supports only new schema.
                 self.assertEqual(int(conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]), 0)
                 self.assertEqual(int(conn.execute("SELECT COUNT(*) FROM signals_meta").fetchone()[0]), 0)
+                self.assertGreaterEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'view' AND name = 'samples'").fetchone()[0]),
+                    1,
+                )
+                self.assertGreaterEqual(
+                    int(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sample_rows'").fetchone()[0]),
+                    1,
+                )
             finally:
                 conn.close()
 

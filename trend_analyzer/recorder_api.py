@@ -193,6 +193,17 @@ class RecorderApiServer:
                     event_limit = _safe_int((query.get("event_limit") or [None])[0], 3000, minimum=1, maximum=20000)
                     bootstrap = _safe_int((query.get("bootstrap") or [None])[0], 0, minimum=0, maximum=1) == 1
                     profile = outer._service.get_runtime_profile()
+                    if not bool(getattr(profile, "archive_to_db", True)):
+                        payload = outer._service.get_live_stream_payload(
+                            since_sample_id=int(since_sample_id),
+                            since_event_id=int(since_event_id),
+                            sample_limit=int(sample_limit),
+                            event_limit=int(event_limit),
+                            bootstrap=bool(bootstrap),
+                        )
+                        payload["format"] = API_FORMAT
+                        self._send_json(HTTPStatus.OK, payload)
+                        return
                     try:
                         conn = self._db_connect()
                     except Exception as exc:
@@ -298,6 +309,15 @@ class RecorderApiServer:
 
                     raw_tag_ids = (query.get("tag_ids") or [""])[0]
                     tag_ids = [item.strip() for item in str(raw_tag_ids).split(",") if item.strip()]
+                    if not bool(getattr(profile, "archive_to_db", True)):
+                        payload = outer._service.get_live_history_payload(
+                            start_ts=float(start_ts),
+                            end_ts=float(end_ts),
+                            tag_ids=tag_ids,
+                        )
+                        payload["format"] = API_FORMAT
+                        self._send_json(HTTPStatus.OK, payload)
+                        return
                     tag_filter_sql = ""
                     params: list[Any] = [profile.id, float(start_ts), float(end_ts)]
                     if tag_ids:

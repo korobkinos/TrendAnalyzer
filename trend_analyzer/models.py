@@ -67,8 +67,13 @@ class SignalConfig:
 class RecorderSourceConfig:
     id: str = field(default_factory=_uuid)
     name: str = "Recorder"
+    source_kind: str = "remote_recorder"  # remote_recorder | modbus_tcp
     host: str = "127.0.0.1"
     port: int = 18777
+    unit_id: int = 1
+    timeout_s: float = 1.0
+    retries: int = 1
+    address_offset: int = 0
     token: str = ""
     enabled: bool = True
     recorder_id: str = ""
@@ -77,8 +82,13 @@ class RecorderSourceConfig:
         return {
             "id": self.id,
             "name": self.name,
+            "source_kind": self.source_kind,
             "host": self.host,
             "port": self.port,
+            "unit_id": self.unit_id,
+            "timeout_s": self.timeout_s,
+            "retries": self.retries,
+            "address_offset": self.address_offset,
             "token": self.token,
             "enabled": self.enabled,
             "recorder_id": self.recorder_id,
@@ -86,15 +96,39 @@ class RecorderSourceConfig:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "RecorderSourceConfig":
+        source_kind_raw = str(payload.get("source_kind") or "").strip().lower()
+        source_kind = source_kind_raw if source_kind_raw in {"remote_recorder", "modbus_tcp"} else "remote_recorder"
+        default_port = 502 if source_kind == "modbus_tcp" else 18777
         try:
-            port = int(payload.get("port") or 18777)
+            port = int(payload.get("port") or default_port)
         except (TypeError, ValueError):
-            port = 18777
+            port = default_port
+        try:
+            unit_id = int(payload.get("unit_id") or 1)
+        except (TypeError, ValueError):
+            unit_id = 1
+        try:
+            timeout_s = float(payload.get("timeout_s") or 1.0)
+        except (TypeError, ValueError):
+            timeout_s = 1.0
+        try:
+            retries = int(payload.get("retries") or 1)
+        except (TypeError, ValueError):
+            retries = 1
+        try:
+            address_offset = int(payload.get("address_offset") or 0)
+        except (TypeError, ValueError):
+            address_offset = 0
         return cls(
             id=str(payload.get("id") or _uuid()),
             name=str(payload.get("name") or "Recorder"),
+            source_kind=source_kind,
             host=str(payload.get("host") or "127.0.0.1"),
             port=max(1, min(65535, port)),
+            unit_id=max(1, min(247, unit_id)),
+            timeout_s=max(0.1, timeout_s),
+            retries=max(0, retries),
+            address_offset=int(address_offset),
             token=str(payload.get("token") or ""),
             enabled=bool(payload.get("enabled", True)),
             recorder_id=str(payload.get("recorder_id") or ""),
@@ -180,6 +214,9 @@ class ProfileConfig:
     archive_deadband: float = 0.0
     archive_keepalive_s: int = 60
     archive_retention_days: int = 7  # 0 = unlimited
+    archive_retention_mode: str = "days"  # days | size
+    archive_max_size_value: int = 1024
+    archive_max_size_unit: str = "MB"  # MB | GB
     archive_to_db: bool = True
     work_mode: str = "online"  # online | offline
     timeout_s: float = 1.0
@@ -190,6 +227,9 @@ class ProfileConfig:
     plot_grid_alpha: int = 25
     plot_grid_x: bool = True
     plot_grid_y: bool = True
+    plot_smoothing_enabled: bool = False
+    plot_smoothing_window: int = 5
+    ui_theme_preset: str = "dark"
     tags_bulk_start_address: int = 0
     tags_bulk_count: int = 10
     tags_bulk_step: int = 1
@@ -223,6 +263,9 @@ class ProfileConfig:
             "archive_deadband": self.archive_deadband,
             "archive_keepalive_s": self.archive_keepalive_s,
             "archive_retention_days": self.archive_retention_days,
+            "archive_retention_mode": self.archive_retention_mode,
+            "archive_max_size_value": self.archive_max_size_value,
+            "archive_max_size_unit": self.archive_max_size_unit,
             "archive_to_db": self.archive_to_db,
             "work_mode": self.work_mode,
             "timeout_s": self.timeout_s,
@@ -233,6 +276,9 @@ class ProfileConfig:
             "plot_grid_alpha": self.plot_grid_alpha,
             "plot_grid_x": self.plot_grid_x,
             "plot_grid_y": self.plot_grid_y,
+            "plot_smoothing_enabled": self.plot_smoothing_enabled,
+            "plot_smoothing_window": self.plot_smoothing_window,
+            "ui_theme_preset": self.ui_theme_preset,
             "tags_bulk_start_address": self.tags_bulk_start_address,
             "tags_bulk_count": self.tags_bulk_count,
             "tags_bulk_step": self.tags_bulk_step,
@@ -278,6 +324,25 @@ class ProfileConfig:
             recorder_api_port = int(payload.get("recorder_api_port") or 18777)
         except (TypeError, ValueError):
             recorder_api_port = 18777
+        archive_retention_mode = str(payload.get("archive_retention_mode") or "days").strip().lower()
+        if archive_retention_mode not in {"days", "size"}:
+            archive_retention_mode = "days"
+        try:
+            archive_max_size_value = int(payload.get("archive_max_size_value", 1024))
+        except (TypeError, ValueError):
+            archive_max_size_value = 1024
+        archive_max_size_value = max(1, min(1024 * 1024, archive_max_size_value))
+        archive_max_size_unit = str(payload.get("archive_max_size_unit") or "MB").strip().upper()
+        if archive_max_size_unit not in {"MB", "GB"}:
+            archive_max_size_unit = "MB"
+        try:
+            plot_smoothing_window = int(payload.get("plot_smoothing_window") or 5)
+        except (TypeError, ValueError):
+            plot_smoothing_window = 5
+        plot_smoothing_window = max(3, min(31, plot_smoothing_window))
+        if plot_smoothing_window % 2 == 0:
+            plot_smoothing_window = plot_smoothing_window + 1 if plot_smoothing_window < 31 else plot_smoothing_window - 1
+        ui_theme_preset = str(payload.get("ui_theme_preset") or "dark").strip() or "dark"
 
         return cls(
             id=str(payload.get("id") or _uuid()),
@@ -293,6 +358,9 @@ class ProfileConfig:
             archive_deadband=max(0.0, float(payload.get("archive_deadband", 0.0))),
             archive_keepalive_s=max(0, int(payload.get("archive_keepalive_s", 60))),
             archive_retention_days=max(0, int(payload.get("archive_retention_days", 7))),
+            archive_retention_mode=archive_retention_mode,
+            archive_max_size_value=archive_max_size_value,
+            archive_max_size_unit=archive_max_size_unit,
             archive_to_db=bool(payload.get("archive_to_db", True)),
             work_mode=work_mode,
             timeout_s=max(0.1, float(payload.get("timeout_s") or 1.0)),
@@ -303,6 +371,9 @@ class ProfileConfig:
             plot_grid_alpha=max(0, min(100, int(payload.get("plot_grid_alpha", 25)))),
             plot_grid_x=bool(payload.get("plot_grid_x", True)),
             plot_grid_y=bool(payload.get("plot_grid_y", True)),
+            plot_smoothing_enabled=bool(payload.get("plot_smoothing_enabled", False)),
+            plot_smoothing_window=plot_smoothing_window,
+            ui_theme_preset=ui_theme_preset,
             tags_bulk_start_address=max(0, int(payload.get("tags_bulk_start_address") or 0)),
             tags_bulk_count=max(1, int(payload.get("tags_bulk_count") or 10)),
             tags_bulk_step=max(1, int(payload.get("tags_bulk_step") or 1)),

@@ -18,10 +18,16 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
   --name TrendAnalyzer `
   --icon assets\app_icon.ico `
   --add-data "assets\app_icon.ico;assets" `
-  --collect-all pyqtgraph `
-  --hidden-import PySide6.QtSvg `
-  --hidden-import PySide6.QtOpenGLWidgets `
   --hidden-import PySide6.QtPrintSupport `
+  --collect-submodules pyqtgraph `
+  --exclude-module pyqtgraph.examples `
+  --exclude-module pyqtgraph.tests `
+  --exclude-module PySide2 `
+  --exclude-module PyQt5 `
+  --exclude-module PyQt6 `
+  --exclude-module tkinter `
+  --exclude-module matplotlib `
+  --exclude-module IPython `
   main.py
 
 Write-Host "Build complete: dist\TrendAnalyzer.exe"
