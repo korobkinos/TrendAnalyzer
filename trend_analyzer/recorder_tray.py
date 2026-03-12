@@ -505,68 +505,10 @@ class RecorderTrayController(QObject):
         return self._terminate_processes(self._iter_residual_recorder_pids())
 
     def _spawn_windows_cleanup_helper(self, *, kill_all_same_exe: bool) -> None:
-        if sys.platform != "win32":
-            return
-        if not getattr(sys, "frozen", False):
-            return
-        if self._cleanup_helper_spawned and kill_all_same_exe:
-            return
-        exe_path = ""
-        try:
-            exe_path = str(Path(sys.executable).resolve())
-        except Exception:
-            return
-        if not exe_path:
-            return
-
-        exe_name = ""
-        try:
-            exe_name = str(Path(exe_path).name).strip()
-        except Exception:
-            exe_name = "TrendRecorder.exe"
-        if kill_all_same_exe:
-            helper_cmd = f"timeout /t 3 /nobreak >nul & taskkill /IM \"{exe_name}\" /F >nul 2>&1"
-        else:
-            exe_path_ps = exe_path.replace("'", "''")
-            filter_expr = (
-                "$_.ExecutablePath -and ([string]$_.ExecutablePath).ToLower() -eq $exe.ToLower() "
-                "-and ([string]$_.Name).ToLower() -eq 'trendrecorder.exe' "
-                "-and ([string]$_.CommandLine).ToLower().Contains('--recorder')"
-            )
-            helper_cmd = (
-                "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "
-                "\""
-                f"$exe = '{exe_path_ps}'; "
-                "Start-Sleep -Milliseconds 2200; "
-                f"Get-CimInstance Win32_Process | Where-Object {{ {filter_expr} }} | "
-                "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }"
-                "\""
-            )
-        kwargs: dict[str, object] = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-            "close_fds": True,
-        }
-        kwargs["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-        try:
-            subprocess.Popen(
-                [
-                    "cmd.exe",
-                    "/d",
-                    "/c",
-                    helper_cmd,
-                ],
-                **kwargs,
-            )
-            if kill_all_same_exe:
-                self._cleanup_helper_spawned = True
-        except Exception:
-            pass
+        # Disabled on purpose: helper used `cmd.exe timeout/taskkill` and could
+        # flash a visible console window on app close. We now rely on direct
+        # in-process termination paths only.
+        return
 
     def _stop_recorder(self, _checked: bool = False, silent: bool = False) -> bool:
         pid = resolve_recorder_pid()

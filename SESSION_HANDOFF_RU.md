@@ -1474,3 +1474,221 @@
 - Validation:
   - `python -m py_compile trend_analyzer/storage.py trend_analyzer/ui.py tests/test_storage_archive.py` -> OK
   - `.venv\\Scripts\\python -m unittest tests.test_storage_archive tests.test_chart_history_merge tests.test_ui_history_restore tests.test_ui_recorder_command tests.test_recorder_service tests.test_models_profile` -> OK
+## 0.61) Update 2026-03-12 (v1.5.19: стабилизация live-старта + очистка mojibake + новая сборка exe)
+
+- User request:
+  - сделать стабилизационный проход по live-графику/X-auto/истории,
+  - полностью убрать битую кириллицу в `ui.py`,
+  - пересобрать свежие `TrendClient.exe` и `TrendRecorder.exe`.
+
+- Implemented (`trend_analyzer/ui.py`):
+  - уменьшена тяжесть онлайн-старта:
+    - добавлены ограничения стартового окна истории по числу активных сигналов:
+      - `_live_startup_history_cap_s()`
+      - `_lightweight_live_history_span_s(...)`
+    - старт live и включение отрисовки графика в онлайн-режиме теперь используют легкий span вместо потенциально очень большого восстановленного окна.
+  - переработана стартовая загрузка online-history:
+    - `_load_recent_online_history_from_db(...)` теперь использует адаптивную выборку через `_query_samples_for_window(...)` (с budget по точкам на сигнал),
+    - добавлен fallback `_query_latest_samples_snapshot(...)` для случаев, когда в окне нет свежих точек (чтобы сразу иметь последние значения и не получать «пустой» график/таблицу),
+    - исправлено сохранение `_history_loaded_bucket_s` по фактическому bucket.
+  - полностью очищены битые строки статуса/ошибок (mojibake) в `ui.py`:
+    - тексты в статус-баре, архиве, экспорте/импорте, печати, подключении и ошибках теперь сохранены в нормальном UTF-8.
+
+- Versioning:
+  - версия повышена до `1.5.19`:
+    - `trend_analyzer/version.py`
+    - `CHANGELOG.md`
+    - `README.md` (заголовок версии)
+    - `DEVELOPMENT_LOG_RU.md` (текущая версия окна)
+
+- Build:
+  - пересобраны роли:
+    - `dist/TrendClient.exe` — `2026-03-12 19:07:32`
+    - `dist/TrendRecorder.exe` — `2026-03-12 19:08:37`
+
+- Validation:
+  - `python -m py_compile trend_analyzer/ui.py trend_analyzer/chart.py trend_analyzer/history_restore.py` -> OK
+  - `.venv\\Scripts\\python -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+## 0.62) Update 2026-03-12 (v1.5.20: live smoothing + momentary bool write)
+
+- User request:
+  - reduce visible jitter of live chart movement;
+  - add spring-loaded button in "Modbus registers" for BOOL bit tags:
+    - press => write 1/True,
+    - release => write 0/False.
+
+- Implemented (`trend_analyzer/ui.py`):
+  - Modbus registers table extended with new last column `Impulse`.
+  - For each row added `QPushButton("Impulse")` with handlers:
+    - `_on_tag_pulse_pressed` -> `_write_tag_row_forced_value(..., 1.0)`
+    - `_on_tag_pulse_released` -> `_write_tag_row_forced_value(..., 0.0)`
+  - Added `_write_tag_row_forced_value(...)` with support for:
+    - local direct Modbus,
+    - selected Modbus source,
+    - remote recorder source via API.
+  - Pulse button is enabled only for `BOOL (bit)` rows.
+  - Added live render anti-jitter compression in follow-latest mode:
+    - `_compress_live_render_batch(...)`
+    - in `_flush_pending_render_samples(...)` each render tick uses one coherent latest snapshot per signal.
+
+- Validation:
+  - `.venv\Scripts\python.exe -m py_compile trend_analyzer\ui.py trend_analyzer\chart.py` -> OK
+  - `.venv\Scripts\python.exe -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+- Build (fresh):
+  - `dist/TrendClient.exe` -> `2026-03-12 20:08:57`
+  - `dist/TrendRecorder.exe` -> `2026-03-12 20:09:59`
+
+## 0.63) Update 2026-03-12 (v1.5.22: close cleanup and online X-follow stabilization)
+
+- Fixed Windows close behavior:
+  - removed client-side post-exit cmd helper (`timeout/taskkill`) from close path.
+  - removed dead helper method from `ui.py`.
+  - disabled tray-side cmd cleanup helper in `recorder_tray.py` (direct in-process stop paths remain).
+
+- Fixed online chart jitter in follow mode:
+  - added monotonic follow guard in `chart.py` (`_last_follow_x_max`) to prevent small backward X jumps.
+  - reset follow guard on manual X interaction and data resets.
+
+- Version:
+  - bumped to `1.5.22`.
+
+- Validation:
+  - `.venv\Scripts\python.exe -m py_compile trend_analyzer\ui.py trend_analyzer\chart.py trend_analyzer\recorder_tray.py` -> OK
+  - `.venv\Scripts\python.exe -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+- Build:
+  - `dist/TrendClient.exe` -> `2026-03-12 20:47:51`
+  - `dist/TrendRecorder.exe` -> `2026-03-12 20:48:53`
+
+## 0.64) Update 2026-03-12 (v1.5.24: zoom-in history visibility fix)
+
+- User report:
+  - archive/history was visible when zoomed out, but could disappear when zooming in.
+
+- Implemented (`trend_analyzer/ui.py`):
+  - strengthened window anchor logic in `_augment_window_with_hold_anchors(...)`:
+    - if no points inside the window:
+      - keep hold line using left anchor value;
+      - if left anchor is absent but right anchor exists, use right anchor value.
+    - if points exist but no left anchor and the first point is after window start:
+      - add fallback point at window start with first visible value.
+  - this removes “empty chart on zoom-in” effect for sparse/change-based archives.
+
+- Validation:
+  - `.venv\Scripts\python.exe -m py_compile trend_analyzer\ui.py trend_analyzer\chart.py trend_analyzer\recorder_tray.py` -> OK
+  - `.venv\Scripts\python.exe -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+- Version:
+  - bumped to `1.5.24`.
+
+- Build (fresh):
+  - `dist/TrendClient.exe`
+  - `dist/TrendRecorder.exe`
+
+## 0.65) Update 2026-03-12 (v1.5.25: clamp hold-line extrapolation)
+
+- User report:
+  - chart had no visible right edge: when panning X to the right, trend line kept appearing indefinitely.
+
+- Root cause:
+  - hold-anchor logic extrapolated value to the current right window edge even if that edge was after the last real sample timestamp.
+
+- Implemented (`trend_analyzer/ui.py`):
+  - in `_augment_window_with_hold_anchors(...)`:
+    - clamp right extension to latest known real sample timestamp for signal;
+    - if window starts strictly after latest real sample, return no points for that signal in window;
+    - keep zoom-in fallback behavior without infinite future extrapolation.
+
+- Validation:
+  - `.venv\Scripts\python.exe -m py_compile trend_analyzer\ui.py` -> OK
+  - `.venv\Scripts\python.exe -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+- Version:
+  - bumped to `1.5.25`.
+
+- Build:
+  - `dist/TrendClient.exe`
+  - `dist/TrendRecorder.exe`
+
+## 0.66) Update 2026-03-12 (v1.5.26: Auto-X follow unfreeze)
+
+- User report:
+  - after previous history clamp fix, Auto-X scrolling looked frozen / not moving.
+
+- Implemented (`trend_analyzer/ui.py`):
+  - improved `_append_ui_heartbeat_if_needed(...)`:
+    - heartbeat timing check is now independent from archive anchor availability;
+    - if no new samples in cycle and last values exist -> push UI heartbeat sample as before;
+    - if no last values available -> still nudge X-window in follow mode using current time (`set_x_window_seconds(..., anchor_ts=now)`), so Auto-X does not freeze.
+  - result: Auto-X motion no longer depends on history-window anchor behavior.
+
+- Validation:
+  - `.venv\Scripts\python.exe -m py_compile trend_analyzer\ui.py` -> OK
+  - `.venv\Scripts\python.exe -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+- Version:
+  - bumped to `1.5.26`.
+
+- Build:
+  - `dist/TrendClient.exe`
+  - `dist/TrendRecorder.exe`
+
+## 0.67) Update 2026-03-12 (v1.5.27: sticky Auto-X + pulse status lock)
+
+- User report:
+  - Auto-X moved differently: chart waited before continuing scroll instead of staying glued to the right edge.
+  - In "Регистры Modbus", when polling is active and pulse button is held, row status flickered between `Импульс=1` and `Прочитано`.
+
+- Implemented:
+  - `trend_analyzer/chart.py`
+    - `set_auto_x(...)`: when re-enabling Auto-X, reset follow anchor to re-attach to latest time immediately.
+    - `_scroll_x_to_latest(...)`:
+      - removed hard dependency on current `x_max`;
+      - added snap-back to latest target when view is ahead in future.
+    - effect: right-edge sticky follow restored.
+  - `trend_analyzer/ui.py`
+    - added `self._tags_pulse_active_tag_ids`.
+    - while pulse is pressed, `_read_tags_once(...)` no longer overwrites row status with `Прочитано/Ошибка чтения` for that tag.
+    - active pulse ids are cleaned on release/removal/clear/tab/profile reload.
+    - effect: status remains `Импульс=1` during hold, then switches after release.
+
+- Validation:
+  - `.venv\Scripts\python.exe -m py_compile trend_analyzer\ui.py trend_analyzer\chart.py` -> OK
+  - `.venv\Scripts\python.exe -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+- Version:
+  - bumped to `1.5.27`.
+
+- Build:
+  - `dist/TrendClient.exe` -> `2026-03-12 22:10:03`
+  - `dist/TrendRecorder.exe` -> `2026-03-12 22:11:05`
+
+## 0.68) Update 2026-03-12 (v1.5.28: distinct button states in UI)
+
+- User request:
+  - disabled/pressed buttons must be visually different from normal buttons.
+
+- Implemented (`trend_analyzer/ui.py`):
+  - updated global themed stylesheet in `_build_ui_theme_stylesheet(...)`:
+    - `QPushButton/QToolButton:pressed` now has stronger visual feedback:
+      - accent border color (`selection_bg`)
+      - small pressed offset via padding.
+    - added explicit `:checked` styling.
+    - added explicit `:disabled` styling:
+      - muted text color (`muted_text`)
+      - darker/lower-contrast background (`input_bg`)
+      - visible border.
+  - this applies to buttons in all windows, including "Регистры Modbus".
+
+- Validation:
+  - `.venv\Scripts\python.exe -m py_compile trend_analyzer\ui.py` -> OK
+  - `.venv\Scripts\python.exe -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+- Version:
+  - bumped to `1.5.28`.
+
+- Build:
+  - `dist/TrendClient.exe` -> `2026-03-12 22:21:08`
+  - `dist/TrendRecorder.exe` -> `2026-03-12 22:22:12`

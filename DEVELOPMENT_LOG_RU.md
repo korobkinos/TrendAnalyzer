@@ -4,7 +4,7 @@
 
 ## Версия продукта
 
-- Текущее имя окна: `Trend Analyzer v1.5.18`
+- Текущее имя окна: `Trend Analyzer v1.5.29`
 - Схема версий: `SemVer` (`MAJOR.MINOR.PATCH`)
   - `1.1.x` — мелкие правки/улучшения (PATCH)
   - `1.x.0` — новые функции без ломки совместимости (MINOR)
@@ -889,3 +889,29 @@
   - verification:
     - `python -m py_compile trend_analyzer/storage.py trend_analyzer/ui.py tests/test_storage_archive.py` -> OK
     - `.venv\\Scripts\\python -m unittest tests.test_storage_archive tests.test_chart_history_merge tests.test_ui_history_restore tests.test_ui_recorder_command tests.test_recorder_service tests.test_models_profile` -> OK
+- 2026-03-12 (v1.5.19, live-start stabilization + full mojibake cleanup in ui.py):
+  - scope:
+    - this pass does **not** change archive schema logic (`storage.py` untouched),
+    - normalized DB structure from previous step remains active (`profiles_meta`, `signal_catalog`, `sample_rows`, `connection_event_rows` + compatibility views).
+  - `trend_analyzer/ui.py`:
+    - added lightweight live-start history policy:
+      - `_live_startup_history_cap_s()`
+      - `_lightweight_live_history_span_s(...)`
+    - `_start_worker(...)` now clamps startup restore span to avoid heavy freezes on launch with many active tags.
+    - `_on_render_chart_toggled(...)` in online mode now restores history with the same lightweight span.
+    - `_load_recent_online_history_from_db(...)` reworked:
+      - uses adaptive `_query_samples_for_window(...)` (point-budget per signal),
+      - fallback to `_query_latest_samples_snapshot(...)` when recent window has no points,
+      - keeps `_history_loaded_bucket_s` from actual query bucket.
+    - cleaned remaining mojibake literals in status/error/export/import/print messages (source strings now UTF-8 readable in code).
+  - versioning:
+    - `trend_analyzer/version.py`: `1.5.18` -> `1.5.19`
+    - `CHANGELOG.md` updated with `1.5.19` entry.
+    - version headers refreshed in `README.md`, `DEVELOPMENT_LOG_RU.md`.
+  - build:
+    - rebuilt role executables:
+      - `dist/TrendClient.exe` (2026-03-12 19:07:32)
+      - `dist/TrendRecorder.exe` (2026-03-12 19:08:37)
+  - verification:
+    - `.venv\\Scripts\\python -m py_compile trend_analyzer\\ui.py trend_analyzer\\chart.py trend_analyzer\\history_restore.py` -> OK
+    - `.venv\\Scripts\\python -m unittest discover -s tests` -> OK (`Ran 43 tests`)

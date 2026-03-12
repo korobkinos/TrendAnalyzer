@@ -1,5 +1,50 @@
 # Changelog
 Все значимые изменения проекта фиксируются в этом файле.
+
+## [1.5.29] - 2026-03-12
+### Changed
+- Fix false unsaved-changes prompt by excluding runtime tag values from dirty-check normalization
+
+## [1.5.28] - 2026-03-12
+### Changed
+- Improve button state visuals: distinct disabled/pressed/checked styles in UI theme
+
+## [1.5.27] - 2026-03-12
+### Changed
+- Restore sticky Auto-X follow and lock Modbus tag status while pulse is held
+
+## [1.5.26] - 2026-03-12
+### Changed
+- Fix Auto-X freeze: decouple follow motion from history anchor availability
+
+## [1.5.25] - 2026-03-12
+### Changed
+- Stop infinite right extrapolation of hold lines; clamp to last real sample ts
+
+## [1.5.24] - 2026-03-12
+### Changed
+- Fix zoom-in archive visibility with robust hold anchors in history window
+
+## [1.5.23] - 2026-03-12
+### Changed
+- Fix zoom-in archive visibility by adding hold anchors for sparse/change-only history windows
+
+## [1.5.22] - 2026-03-12
+### Changed
+- Disable Windows cmd cleanup helper on close and smooth online X-follow to prevent backward jitter
+
+## [1.5.21] - 2026-03-12
+### Changed
+- Client now starts recorder in tray mode (--recorder-tray) to avoid hidden service-only orphan processes
+
+## [1.5.20] - 2026-03-12
+### Changed
+- Live chart smoothing and Modbus momentary pulse button
+
+## [1.5.19] - 2026-03-12
+### Changed
+- Стабилизация live-графика (ограничение стартовой истории, адаптивная выборка) и полная чистка битых строк статуса в UI
+
 ## [1.5.18] - 2026-03-11
 ### Added
 - Добавлен визуальный индикатор выполнения ресурсоёмких операций:

@@ -40,7 +40,7 @@ class ViewerRecorderCommandTests(unittest.TestCase):
             finally:
                 self._restore_frozen(prev_frozen, prev_exe)
 
-            self.assertEqual(cmd, [str(recorder_exe.resolve()), "--recorder"])
+            self.assertEqual(cmd, [str(recorder_exe.resolve()), "--recorder-tray"])
 
     def test_external_recorder_command_raises_if_recorder_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

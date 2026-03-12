@@ -159,6 +159,7 @@ class MultiAxisChart(QWidget):
         self._connection_events: list[tuple[float, bool]] = []
         self._connection_regions: list[pg.LinearRegionItem] = []
         self._last_wheel_ts = 0.0
+        self._last_follow_x_max: float | None = None
 
     def eventFilter(self, watched, event):
         if watched is self.plot_widget.viewport():
@@ -657,6 +658,7 @@ class MultiAxisChart(QWidget):
         for signal_id in list(self._buffers.keys()):
             self._buffers[signal_id] = ([], [])
         self._last_sample_ts = None
+        self._last_follow_x_max = None
         self.cursor_line.hide()
         self._cursor_ratio = None
         self._redraw_all()
@@ -681,6 +683,7 @@ class MultiAxisChart(QWidget):
             self._refresh_signal_buffer(signal_id)
 
         self._recompute_last_sample_ts()
+        self._last_follow_x_max = None
         self._prune_connection_events_to_data_window()
         self._redraw_all()
         self._apply_auto_range()
@@ -732,11 +735,17 @@ class MultiAxisChart(QWidget):
         return payload
 
     def set_auto_x(self, enabled: bool) -> None:
+        prev_auto_x = bool(self._auto_x)
         self._auto_x = bool(enabled)
         # When Auto X is unchecked, keep following the latest edge until the
         # user actually changes X manually. This prevents an immediate "freeze"
         # impression right after toggling the option off.
         self._soft_follow_latest_x = not self._auto_x
+        if self._auto_x and not prev_auto_x:
+            # Re-enable should always re-anchor to latest time immediately.
+            self._last_follow_x_max = None
+        if not self._follows_latest_x():
+            self._last_follow_x_max = None
         if self._follows_latest_x() and self._last_sample_ts is not None:
             self._scroll_x_to_latest(self._last_sample_ts)
         self._apply_auto_range()
@@ -751,6 +760,7 @@ class MultiAxisChart(QWidget):
     def force_manual_x(self) -> None:
         self._auto_x = False
         self._soft_follow_latest_x = False
+        self._last_follow_x_max = None
         self._apply_auto_range()
         self._emit_scales_changed()
 
@@ -793,6 +803,7 @@ class MultiAxisChart(QWidget):
             self.plot_item.vb.setXRange(left, right, padding=0)
         finally:
             self._programmatic_x_change = False
+        self._last_follow_x_max = float(right)
         self._redraw_all()
         if self.cursor_line.isVisible():
             self._update_cursor_values()
@@ -1045,13 +1056,26 @@ class MultiAxisChart(QWidget):
         if span <= 0 or span > 86400:
             span = 60.0
         margin = max(0.02 * span, 0.1)
-        new_max = latest_ts + margin
+        target_max = float(latest_ts) + margin
+        # Keep follow motion monotonic to avoid visible "step back" jitter
+        # when multiple timing sources (poll/render/heartbeat) race.
+        # Do not hard-bind to current x_max; otherwise after a manual pan to
+        # future Auto-X may appear frozen until time "catches up".
+        if self._last_follow_x_max is None:
+            new_max = float(target_max)
+        else:
+            snap_back_threshold = max(0.05 * span, 0.2)
+            if float(x_max) > (float(target_max) + snap_back_threshold):
+                new_max = float(target_max)
+            else:
+                new_max = max(float(self._last_follow_x_max), float(target_max))
         new_min = new_max - span
         self._programmatic_x_change = True
         try:
             self.plot_item.vb.setXRange(new_min, new_max, padding=0)
         finally:
             self._programmatic_x_change = False
+        self._last_follow_x_max = float(new_max)
 
     def reset_view(self) -> None:
         for axis_index in self._axis_signals.keys():
@@ -1646,11 +1670,13 @@ class MultiAxisChart(QWidget):
         affects_x = bool(len(mask) > 0 and mask[0]) if mask is not None else True
         if affects_x and (not self._auto_x) and self._soft_follow_latest_x:
             self._soft_follow_latest_x = False
+            self._last_follow_x_max = None
         # Keep Auto X enabled for wheel zoom; disable for manual X pan/scroll.
         wheel_recent = (time.monotonic() - self._last_wheel_ts) <= 0.25
         if affects_x and self._auto_x and not wheel_recent:
             self._auto_x = False
             self._soft_follow_latest_x = False
+            self._last_follow_x_max = None
             self.auto_mode_changed.emit(self._auto_x, self._auto_y)
 
     def _on_main_y_range_changed(self, _view_box, new_range) -> None:
