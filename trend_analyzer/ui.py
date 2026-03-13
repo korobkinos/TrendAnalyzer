@@ -715,9 +715,14 @@ class MainWindow(QMainWindow):
         self._db_live_conn: sqlite3.Connection | None = None
         self._db_live_running = False
         self._local_live_enabled = True
+        self._local_live_transport = "none"
         self._db_live_last_sample_row_id = 0
         self._db_live_last_connection_event_row_id = 0
         self._local_api_live_cursor: dict[str, int] = {"sample_id": 0, "event_id": 0}
+        self._local_live_future: concurrent.futures.Future | None = None
+        self._local_live_backoff_until_mono = 0.0
+        self._local_live_fail_count = 0
+        self._local_last_ok_mono: float | None = None
         self._remote_live_cursors: dict[str, dict[str, int]] = {}
         self._remote_live_executor: concurrent.futures.ThreadPoolExecutor | None = concurrent.futures.ThreadPoolExecutor(
             max_workers=8,
@@ -753,6 +758,17 @@ class MainWindow(QMainWindow):
         self._active_tags_tab_index = -1
         self._updating_tags_tabs = False
         self._tags_pulse_active_tag_ids: set[str] = set()
+        self._tags_pulse_active_rows: dict[str, int] = {}
+        self._tags_pulse_release_guard = False
+        self._tags_pulse_resume_poll_after_release = False
+        self._tags_pulse_hold_timer = QTimer(self)
+        self._tags_pulse_hold_timer.setSingleShot(False)
+        self._tags_pulse_hold_timer.setInterval(120)
+        self._tags_pulse_hold_timer.timeout.connect(self._maintain_active_tag_pulses)
+        self._tags_pulse_fail_safe_timer = QTimer(self)
+        self._tags_pulse_fail_safe_timer.setSingleShot(True)
+        self._tags_pulse_fail_safe_timer.setInterval(1200)
+        self._tags_pulse_fail_safe_timer.timeout.connect(self._release_all_active_tag_pulses)
         self._updating_signal_source_tabs = False
         self._active_signal_source_id = "local"
         self._config_dirty = False
@@ -798,6 +814,9 @@ class MainWindow(QMainWindow):
                 self._psutil_process.cpu_percent(interval=None)
             except Exception:
                 self._psutil_process = None
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._runtime_stats_timer = QTimer(self)
         self._runtime_stats_timer.setSingleShot(False)
         self._runtime_stats_timer.setInterval(1000)
@@ -1030,6 +1049,15 @@ class MainWindow(QMainWindow):
         self._update_runtime_status_panel()
         self._runtime_stats_timer.start()
         self._update_recorder_dependent_ui_state()
+
+    def eventFilter(self, watched, event):  # type: ignore[override]
+        if (
+            event is not None
+            and event.type() == QEvent.Type.MouseButtonRelease
+            and bool(self._tags_pulse_active_tag_ids)
+        ):
+            QTimer.singleShot(0, self._release_all_active_tag_pulses)
+        return super().eventFilter(watched, event)
 
     def _set_busy_state(self, busy: bool, status_text: str | None = None) -> None:
         if busy:
@@ -1303,6 +1331,7 @@ class MainWindow(QMainWindow):
         self._update_window_title_connection()
 
     def _on_archive_filter_settings_changed(self, *_args) -> None:
+        self._update_connection_settings_visibility()
         if self._updating_ui:
             return
         self.current_profile.archive_on_change_only = bool(self.archive_on_change_checkbox.isChecked())
@@ -1558,6 +1587,19 @@ class MainWindow(QMainWindow):
             return
         self.current_profile.archive_retention_mode = "size" if is_size else "days"
         self._mark_config_dirty()
+
+    def _update_connection_settings_visibility(self, *_args) -> None:
+        archive_filters_visible = bool(self.archive_on_change_checkbox.isChecked())
+        if hasattr(self, "archive_filters_widget"):
+            self.archive_filters_widget.setVisible(archive_filters_visible)
+
+        advanced_visible = bool(getattr(self, "connection_advanced_toggle", None) and self.connection_advanced_toggle.isChecked())
+        if hasattr(self, "connection_advanced_widget"):
+            self.connection_advanced_widget.setVisible(advanced_visible)
+
+        api_settings_visible = advanced_visible and bool(self.recorder_api_enabled_checkbox.isChecked())
+        if hasattr(self, "recorder_api_settings_widget"):
+            self.recorder_api_settings_widget.setVisible(api_settings_visible)
 
     @staticmethod
     def _theme_palette(theme_id: str) -> dict[str, str]:
@@ -1906,6 +1948,8 @@ class MainWindow(QMainWindow):
         self.connection_sources_summary_label.setStyleSheet("color: #aeb7c3;")
         self.connection_manage_sources_btn = QPushButton("Источники данных...")
         self.connection_manage_sources_btn.clicked.connect(lambda: self._show_tool_window(self.sources_window, True))
+        self.connection_manage_sources_btn.setAutoDefault(False)
+        self.connection_manage_sources_btn.setDefault(False)
         summary_row.addWidget(self.connection_sources_summary_label, 1)
         summary_row.addWidget(self.connection_manage_sources_btn)
         layout.addLayout(summary_row)
@@ -1918,7 +1962,11 @@ class MainWindow(QMainWindow):
         self.connection_sources_hint_label.setStyleSheet("color: #8f98a6; font-size: 11px;")
         layout.addWidget(self.connection_sources_hint_label)
 
-        form = QFormLayout()
+        def _section_title(text: str) -> QLabel:
+            label = QLabel(str(text))
+            label.setStyleSheet("font-weight: 600; color: #cfd7e3; padding-top: 6px;")
+            return label
+
         self.profile_name_edit = QLineEdit()
         self.ip_edit = QLineEdit()
 
@@ -1995,38 +2043,81 @@ class MainWindow(QMainWindow):
         self.port_spin.valueChanged.connect(lambda *_args: self._refresh_connection_sources_summary())
         self.unit_id_spin.valueChanged.connect(lambda *_args: self._refresh_connection_sources_summary())
 
-        form.addRow('Имя профиля', self.profile_name_edit)
-        form.addRow("Локальный IP (Modbus)", self.ip_edit)
-        form.addRow('Локальный порт', self.port_spin)
-        form.addRow('Локальный Unit ID', self.unit_id_spin)
-        form.addRow('Частота опроса', self.poll_interval_spin)
-        form.addRow('Интервал отрисовки', self.render_interval_spin)
-        form.addRow('Отрисовка графика', self.render_chart_checkbox)
-        form.addRow('Частота архивации', self.archive_interval_spin)
-        form.addRow('Архив: только изменения', self.archive_on_change_checkbox)
-        form.addRow('Архив: deadband', self.archive_deadband_spin)
-        form.addRow('Архив: keepalive', self.archive_keepalive_spin)
-        form.addRow('Ограничение архива', self.archive_retention_mode_combo)
-        form.addRow('Глубина архива (дни)', self.archive_retention_days_spin)
-        form.addRow('Глубина архива (размер)', self.archive_max_size_widget)
-        form.addRow('Таймаут (лок./по умолч.)', self.timeout_spin)
-        form.addRow('Повторы (лок./по умолч.)', self.retries_spin)
-        form.addRow('Смещение адреса (лок./по умолч.)', self.address_offset_spin)
-        form.addRow('API локального recorder', self.recorder_api_enabled_checkbox)
-        form.addRow("API host", self.recorder_api_host_edit)
-        form.addRow("API port", self.recorder_api_port_spin)
-        form.addRow("API token", self.recorder_api_token_edit)
-        layout.addLayout(form)
+        layout.addWidget(_section_title("Основное"))
+        basic_form = QFormLayout()
+        basic_form.addRow('Имя профиля', self.profile_name_edit)
+        basic_form.addRow("Локальный IP (Modbus)", self.ip_edit)
+        basic_form.addRow('Локальный порт', self.port_spin)
+        basic_form.addRow('Локальный Unit ID', self.unit_id_spin)
+        basic_form.addRow('Частота опроса', self.poll_interval_spin)
+        basic_form.addRow('Интервал отрисовки', self.render_interval_spin)
+        basic_form.addRow('Отрисовка графика', self.render_chart_checkbox)
+        layout.addLayout(basic_form)
+
+        layout.addWidget(_section_title("Архив"))
+        archive_form = QFormLayout()
+        archive_form.addRow('Частота архивации', self.archive_interval_spin)
+        archive_form.addRow('Архив: только изменения', self.archive_on_change_checkbox)
+        archive_form.addRow('Ограничение архива', self.archive_retention_mode_combo)
+        archive_form.addRow('Глубина архива (дни)', self.archive_retention_days_spin)
+        archive_form.addRow('Глубина архива (размер)', self.archive_max_size_widget)
+        layout.addLayout(archive_form)
+
+        self.archive_filters_widget = QWidget()
+        archive_filters_layout = QFormLayout(self.archive_filters_widget)
+        archive_filters_layout.setContentsMargins(0, 0, 0, 0)
+        archive_filters_layout.addRow(QLabel("Фильтрация архива"))
+        archive_filters_layout.addRow('deadband', self.archive_deadband_spin)
+        archive_filters_layout.addRow('keepalive', self.archive_keepalive_spin)
+        layout.addWidget(self.archive_filters_widget)
+
+        advanced_toggle_row = QHBoxLayout()
+        self.connection_advanced_toggle = QCheckBox('Показать доп. настройки')
+        self.connection_advanced_toggle.toggled.connect(self._update_connection_settings_visibility)
+        advanced_toggle_row.addWidget(self.connection_advanced_toggle)
+        advanced_toggle_row.addStretch(1)
+        layout.addLayout(advanced_toggle_row)
+
+        self.connection_advanced_widget = QWidget()
+        advanced_layout = QVBoxLayout(self.connection_advanced_widget)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setSpacing(6)
+        advanced_layout.addWidget(_section_title("Дополнительно"))
+
+        advanced_form = QFormLayout()
+        advanced_form.addRow('Таймаут (лок./по умолч.)', self.timeout_spin)
+        advanced_form.addRow('Повторы (лок./по умолч.)', self.retries_spin)
+        advanced_form.addRow('Смещение адреса (лок./по умолч.)', self.address_offset_spin)
+        advanced_form.addRow('API локального recorder', self.recorder_api_enabled_checkbox)
+        advanced_layout.addLayout(advanced_form)
+
+        self.recorder_api_settings_widget = QWidget()
+        recorder_api_form = QFormLayout(self.recorder_api_settings_widget)
+        recorder_api_form.setContentsMargins(0, 0, 0, 0)
+        recorder_api_form.addRow("API host", self.recorder_api_host_edit)
+        recorder_api_form.addRow("API port", self.recorder_api_port_spin)
+        recorder_api_form.addRow("API token", self.recorder_api_token_edit)
+        advanced_layout.addWidget(self.recorder_api_settings_widget)
+        layout.addWidget(self.connection_advanced_widget)
+
+        self.recorder_api_enabled_checkbox.toggled.connect(self._update_connection_settings_visibility)
 
         self.apply_btn = QPushButton('Применить')
         self.apply_btn.clicked.connect(self._apply_current_profile)
         self.clear_archive_db_btn = QPushButton('Очистить архив БД')
         self.clear_archive_db_btn.clicked.connect(self._on_clear_archive_db_clicked)
+        for button in (
+            self.apply_btn,
+            self.clear_archive_db_btn,
+        ):
+            button.setAutoDefault(False)
+            button.setDefault(False)
         action_row = QHBoxLayout()
         action_row.addWidget(self.apply_btn)
         action_row.addWidget(self.clear_archive_db_btn)
         layout.addLayout(action_row)
         self._refresh_connection_sources_summary()
+        self._update_connection_settings_visibility()
 
     def _build_signals_window(self) -> None:
         flags = (
@@ -2300,17 +2391,48 @@ class MainWindow(QMainWindow):
             return False
         return cls._normalize_source_kind(getattr(source, "source_kind", SOURCE_KIND_REMOTE)) == SOURCE_KIND_MODBUS
 
+    def _effective_local_modbus_settings(self) -> tuple[str, int, int, float, int, int]:
+        profile = getattr(self, "current_profile", None)
+        host = str(getattr(profile, "ip", "127.0.0.1") or "127.0.0.1")
+        port = int(getattr(profile, "port", 502) or 502)
+        unit_id = int(getattr(profile, "unit_id", 1) or 1)
+        timeout_s = float(getattr(profile, "timeout_s", 1.0) or 1.0)
+        address_offset = int(getattr(profile, "address_offset", 0) or 0)
+        retries = int(getattr(profile, "retries", 1) or 1)
+
+        # Keep local/direct Modbus tools in sync with what the user currently sees
+        # in the connection settings window, even before Apply/Save is pressed.
+        if hasattr(self, "ip_edit") and isinstance(self.ip_edit, QLineEdit):
+            ui_host = self.ip_edit.text().strip()
+            if ui_host:
+                host = ui_host
+        if hasattr(self, "port_spin") and isinstance(self.port_spin, QSpinBox):
+            port = int(self.port_spin.value())
+        if hasattr(self, "unit_id_spin") and isinstance(self.unit_id_spin, QSpinBox):
+            unit_id = int(self.unit_id_spin.value())
+        if hasattr(self, "timeout_spin") and isinstance(self.timeout_spin, QDoubleSpinBox):
+            timeout_s = float(self.timeout_spin.value())
+        if hasattr(self, "address_offset_spin") and isinstance(self.address_offset_spin, QSpinBox):
+            address_offset = int(self.address_offset_spin.value())
+        if hasattr(self, "retries_spin") and isinstance(self.retries_spin, QSpinBox):
+            retries = int(self.retries_spin.value())
+
+        return (
+            str(host or "127.0.0.1"),
+            max(1, min(65535, int(port))),
+            max(1, min(247, int(unit_id))),
+            max(0.1, float(timeout_s)),
+            int(address_offset),
+            max(0, int(retries)),
+        )
+
     def _source_modbus_settings(
         self,
         source: RecorderSourceConfig | None,
     ) -> tuple[str, int, int, float, int, int]:
-        profile = getattr(self, "current_profile", None)
-        default_host = str(getattr(profile, "ip", "127.0.0.1") or "127.0.0.1")
-        default_port = int(getattr(profile, "port", 502) or 502)
-        default_unit_id = int(getattr(profile, "unit_id", 1) or 1)
-        default_timeout = float(getattr(profile, "timeout_s", 1.0) or 1.0)
-        default_offset = int(getattr(profile, "address_offset", 0) or 0)
-        default_retries = int(getattr(profile, "retries", 1) or 1)
+        default_host, default_port, default_unit_id, default_timeout, default_offset, default_retries = (
+            self._effective_local_modbus_settings()
+        )
         if source is None:
             return (default_host, default_port, default_unit_id, default_timeout, default_offset, default_retries)
         host = str(getattr(source, "host", default_host) or default_host)
@@ -2496,12 +2618,8 @@ class MainWindow(QMainWindow):
         return result
 
     def _signal_source_edit_items(self) -> list[tuple[str, str]]:
+        host, port, _unit_id, _timeout_s, _offset, _retries = self._effective_local_modbus_settings()
         profile = getattr(self, "current_profile", None)
-        host = str(getattr(profile, "ip", "127.0.0.1") or "127.0.0.1")
-        try:
-            port = int(getattr(profile, "port", 502) or 502)
-        except Exception:
-            port = 502
         items: list[tuple[str, str]] = [("local", f"Локальный Modbus ({host}:{port})")]
         seen: set[str] = {"local"}
         if hasattr(self, "sources_table"):
@@ -2564,16 +2682,8 @@ class MainWindow(QMainWindow):
     def _refresh_connection_sources_summary(self) -> None:
         if not hasattr(self, "connection_sources_summary_label"):
             return
+        host, port, unit_id, _timeout_s, _offset, _retries = self._effective_local_modbus_settings()
         profile = getattr(self, "current_profile", None)
-        host = str(getattr(profile, "ip", "127.0.0.1") or "127.0.0.1")
-        try:
-            port = int(getattr(profile, "port", 502) or 502)
-        except Exception:
-            port = 502
-        try:
-            unit_id = int(getattr(profile, "unit_id", 1) or 1)
-        except Exception:
-            unit_id = 1
 
         sources = self._collect_sources_table() if hasattr(self, "sources_table") else list(getattr(profile, "recorder_sources", []) or [])
         enabled_sources = [source for source in sources if bool(getattr(source, "enabled", False))]
@@ -2600,12 +2710,7 @@ class MainWindow(QMainWindow):
     ) -> str:
         sid = str(source_id or "local").strip() or "local"
         if sid == "local":
-            profile = getattr(self, "current_profile", None)
-            host = str(getattr(profile, "ip", "127.0.0.1") or "127.0.0.1")
-            try:
-                port = int(getattr(profile, "port", 502) or 502)
-            except Exception:
-                port = 502
+            host, port, _unit_id, _timeout_s, _offset, _retries = self._effective_local_modbus_settings()
             return f"{host}:{port}"
         if source_map and sid in source_map:
             source = source_map[sid]
@@ -2621,12 +2726,7 @@ class MainWindow(QMainWindow):
         return f"{source.host}:{source.port}"
 
     def _get_signal_source_tab_items(self) -> list[tuple[str, str]]:
-        profile = getattr(self, "current_profile", None)
-        host = str(getattr(profile, "ip", "127.0.0.1") or "127.0.0.1")
-        try:
-            port = int(getattr(profile, "port", 502) or 502)
-        except Exception:
-            port = 502
+        host, port, _unit_id, _timeout_s, _offset, _retries = self._effective_local_modbus_settings()
         items: list[tuple[str, str]] = [
             (SIGNAL_SOURCE_ALL, "Все источники"),
             ("local", f"Локальный ({host}:{port})"),
@@ -2774,6 +2874,15 @@ class MainWindow(QMainWindow):
         if source_id == "local":
             return None
         return self._source_by_id(source_id)
+
+    def _effective_tags_source_for_io(self) -> RecorderSourceConfig | None:
+        source = self._selected_tags_source()
+        if source is not None:
+            return source
+        proxy_source = self._local_modbus_proxy_source()
+        if proxy_source is not None:
+            return proxy_source
+        return None
 
     def _collect_sources_table(self) -> list[RecorderSourceConfig]:
         rows: list[RecorderSourceConfig] = []
@@ -3750,6 +3859,9 @@ class MainWindow(QMainWindow):
 
     def _load_active_tags_tab_to_table(self) -> None:
         self._tags_pulse_active_tag_ids.clear()
+        self._tags_pulse_active_rows.clear()
+        self._tags_pulse_hold_timer.stop()
+        self._tags_pulse_fail_safe_timer.stop()
         self.tags_table.setRowCount(0)
         if self._active_tags_tab_index < 0 or self._active_tags_tab_index >= len(self._tags_tabs):
             self._fit_tags_table_columns(initial=True)
@@ -4008,6 +4120,9 @@ class MainWindow(QMainWindow):
 
     def _load_tags_to_ui(self, profile: ProfileConfig) -> None:
         self._tags_pulse_active_tag_ids.clear()
+        self._tags_pulse_active_rows.clear()
+        self._tags_pulse_hold_timer.stop()
+        self._tags_pulse_fail_safe_timer.stop()
         self.tags_start_addr_spin.setValue(max(0, int(profile.tags_bulk_start_address)))
         self.tags_count_spin.setValue(max(1, int(profile.tags_bulk_count)))
         self.tags_step_spin.setValue(max(1, int(profile.tags_bulk_step)))
@@ -4147,7 +4262,7 @@ class MainWindow(QMainWindow):
         row = self._table_row_for_widget(self.tags_table, button, 8)
         if row < 0:
             return
-        source = self._selected_tags_source()
+        source = self._effective_tags_source_for_io()
         if source is None:
             client = self._open_tags_client()
             if client is None:
@@ -4217,42 +4332,143 @@ class MainWindow(QMainWindow):
             value_spin.blockSignals(False)
 
         write_value = 1.0 if float(forced_value) != 0.0 else 0.0
-        source = self._selected_tags_source()
+        source = self._effective_tags_source_for_io()
         if source is None:
-            client = self._open_tags_client()
-            if client is None:
-                return False, 'Нет связи'
-            try:
-                self._write_single_tag(client, tag, write_value)
-            finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-            return True, f"{tag.name} MW{tag.address}: импульс {int(write_value)}"
+            _host, _port, _unit_id, _timeout_s, _address_offset, retries = self._effective_local_modbus_settings()
+            attempts = max(1, int(retries) + 1)
+            last_error = 'Нет связи'
+            for attempt in range(attempts):
+                client = self._open_tags_client()
+                if client is None:
+                    last_error = 'Нет связи'
+                else:
+                    try:
+                        self._write_single_tag(client, tag, write_value)
+                        return True, f"{tag.name} MW{tag.address}: импульс {int(write_value)}"
+                    except Exception as exc:
+                        last_error = str(exc)
+                    finally:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                if attempt + 1 < attempts:
+                    time.sleep(0.05)
+            return False, str(last_error or 'Нет связи')
 
         if self._is_modbus_source(source):
-            host, port, unit_id, _timeout_s, address_offset, _retries = self._source_modbus_settings(source)
-            client = self._open_tags_client_for_source(source)
-            if client is None:
-                return False, f'Нет связи с {host}:{port}'
-            try:
-                self._write_single_tag(
-                    client,
-                    tag,
-                    write_value,
-                    unit_id=unit_id,
-                    address_offset=address_offset,
-                )
-            finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-            return True, f"{host}:{port}/{tag.name} MW{tag.address}: импульс {int(write_value)}"
+            host, port, unit_id, _timeout_s, address_offset, retries = self._source_modbus_settings(source)
+            attempts = max(1, int(retries) + 1)
+            last_error = f'Нет связи с {host}:{port}'
+            for attempt in range(attempts):
+                client = self._open_tags_client_for_source(source)
+                if client is None:
+                    last_error = f'Нет связи с {host}:{port}'
+                else:
+                    try:
+                        self._write_single_tag(
+                            client,
+                            tag,
+                            write_value,
+                            unit_id=unit_id,
+                            address_offset=address_offset,
+                        )
+                        return True, f"{host}:{port}/{tag.name} MW{tag.address}: импульс {int(write_value)}"
+                    except Exception as exc:
+                        last_error = str(exc)
+                    finally:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                if attempt + 1 < attempts:
+                    time.sleep(0.05)
+            return False, str(last_error or f'Нет связи с {host}:{port}')
 
         self._write_single_tag_remote(source, tag, write_value)
         return True, f"{source.name}/{tag.name} MW{tag.address}: импульс {int(write_value)}"
+
+    def _active_pulse_tag_id_for_row(self, row: int) -> str:
+        for pulse_tag_id, active_row in list(self._tags_pulse_active_rows.items()):
+            try:
+                if int(active_row) == int(row):
+                    return str(pulse_tag_id)
+            except Exception:
+                continue
+        return ""
+
+    def _pulse_button_for_row(self, row: int) -> QPushButton | None:
+        if row < 0 or row >= self.tags_table.rowCount():
+            return None
+        button = self.tags_table.cellWidget(row, 10)
+        if isinstance(button, QPushButton):
+            return button
+        return None
+
+    def _maintain_active_tag_pulses(self) -> None:
+        active_pairs = list(self._tags_pulse_active_rows.items())
+        if not active_pairs:
+            self._resume_tags_polling_after_pulse_if_needed()
+            return
+        for pulse_tag_id, row in active_pairs:
+            row_i = int(row)
+            button = self._pulse_button_for_row(row_i)
+            if button is None or not bool(button.isDown()):
+                self._finish_tag_pulse(row_i, str(pulse_tag_id))
+                continue
+            ok, message = self._write_tag_row_forced_value(row_i, 1.0)
+            if ok:
+                self._set_tag_row_status(row_i, 'Импульс=1', error=False)
+                self.status_label.setText(f"Статус: {message}")
+                self._tags_pulse_fail_safe_timer.start()
+            else:
+                self._set_tag_row_status(row_i, 'Ошибка импульса', error=True)
+                self.status_label.setText(f"Ошибка импульса строки {row_i + 1}: {message}")
+
+    def _resume_tags_polling_after_pulse_if_needed(self) -> None:
+        if bool(self._tags_pulse_active_tag_ids):
+            return
+        if self._tags_pulse_hold_timer.isActive():
+            self._tags_pulse_hold_timer.stop()
+        if self._tags_pulse_fail_safe_timer.isActive():
+            self._tags_pulse_fail_safe_timer.stop()
+        if not bool(self._tags_pulse_resume_poll_after_release):
+            return
+        self._tags_pulse_resume_poll_after_release = False
+        interval_ms = max(100, int(self.tags_poll_interval_spin.value())) if hasattr(self, "tags_poll_interval_spin") else 100
+        self._tags_poll_timer.start(interval_ms)
+        self._sync_tags_poll_buttons()
+
+    def _finish_tag_pulse(self, row: int, pulse_tag_id: str) -> None:
+        if not pulse_tag_id:
+            pulse_tag_id = self._active_pulse_tag_id_for_row(row)
+        if pulse_tag_id and pulse_tag_id not in self._tags_pulse_active_tag_ids:
+            return
+        ok, message = self._write_tag_row_forced_value(row, 0.0)
+        if ok:
+            self._set_tag_row_status(row, 'Импульс=0', error=False)
+            self.status_label.setText(f"Статус: {message}")
+        else:
+            self._set_tag_row_status(row, 'Ошибка импульса', error=True)
+            self.status_label.setText(f"Ошибка импульса строки {row + 1}: {message}")
+        if pulse_tag_id:
+            self._tags_pulse_active_tag_ids.discard(pulse_tag_id)
+            self._tags_pulse_active_rows.pop(pulse_tag_id, None)
+        self._resume_tags_polling_after_pulse_if_needed()
+
+    def _release_all_active_tag_pulses(self) -> None:
+        if self._tags_pulse_release_guard:
+            return
+        active_pairs = list(self._tags_pulse_active_rows.items())
+        if not active_pairs:
+            self._resume_tags_polling_after_pulse_if_needed()
+            return
+        self._tags_pulse_release_guard = True
+        try:
+            for pulse_tag_id, row in active_pairs:
+                self._finish_tag_pulse(int(row), str(pulse_tag_id))
+        finally:
+            self._tags_pulse_release_guard = False
 
     def _on_tag_pulse_pressed(self) -> None:
         button = self.sender()
@@ -4261,12 +4477,21 @@ class MainWindow(QMainWindow):
         row = self._table_row_for_widget(self.tags_table, button, 10)
         if row < 0:
             return
+        if bool(self._tags_pulse_active_tag_ids):
+            self._release_all_active_tag_pulses()
+        if self._tags_poll_timer.isActive():
+            self._tags_pulse_resume_poll_after_release = True
+            self._stop_tags_polling(silent=True)
         tag = self._collect_tag_row(row)
         pulse_tag_id = str(tag.id or "").strip() if tag is not None else ""
-        if pulse_tag_id:
-            self._tags_pulse_active_tag_ids.add(pulse_tag_id)
         ok, message = self._write_tag_row_forced_value(row, 1.0)
         if ok:
+            if pulse_tag_id:
+                self._tags_pulse_active_tag_ids.add(pulse_tag_id)
+                self._tags_pulse_active_rows[pulse_tag_id] = int(row)
+            if not self._tags_pulse_hold_timer.isActive():
+                self._tags_pulse_hold_timer.start()
+            self._tags_pulse_fail_safe_timer.start()
             self._set_tag_row_status(row, 'Импульс=1', error=False)
             self.status_label.setText(f"Статус: {message}")
         else:
@@ -4274,6 +4499,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Ошибка импульса строки {row + 1}: {message}")
             if pulse_tag_id:
                 self._tags_pulse_active_tag_ids.discard(pulse_tag_id)
+                self._tags_pulse_active_rows.pop(pulse_tag_id, None)
+            self._resume_tags_polling_after_pulse_if_needed()
 
     def _on_tag_pulse_released(self) -> None:
         button = self.sender()
@@ -4284,15 +4511,9 @@ class MainWindow(QMainWindow):
             return
         tag = self._collect_tag_row(row)
         pulse_tag_id = str(tag.id or "").strip() if tag is not None else ""
-        ok, message = self._write_tag_row_forced_value(row, 0.0)
-        if ok:
-            self._set_tag_row_status(row, 'Импульс=0', error=False)
-            self.status_label.setText(f"Статус: {message}")
-        else:
-            self._set_tag_row_status(row, 'Ошибка импульса', error=True)
-            self.status_label.setText(f"Ошибка импульса строки {row + 1}: {message}")
-        if pulse_tag_id:
-            self._tags_pulse_active_tag_ids.discard(pulse_tag_id)
+        if not pulse_tag_id:
+            pulse_tag_id = self._active_pulse_tag_id_for_row(row)
+        self._finish_tag_pulse(row, pulse_tag_id)
 
     def _on_add_tag_clicked(self, _checked: bool = False) -> None:
         self._add_tag_row()
@@ -4311,6 +4532,8 @@ class MainWindow(QMainWindow):
             self.tags_table.removeRow(row)
         for tag_id in removed_tag_ids:
             self._tags_pulse_active_tag_ids.discard(tag_id)
+            self._tags_pulse_active_rows.pop(tag_id, None)
+        self._resume_tags_polling_after_pulse_if_needed()
         self._fit_tags_table_columns(initial=False)
 
     def _on_clear_tags_clicked(self, _checked: bool = False) -> None:
@@ -4327,6 +4550,9 @@ class MainWindow(QMainWindow):
             return
         self.tags_table.setRowCount(0)
         self._tags_pulse_active_tag_ids.clear()
+        self._tags_pulse_active_rows.clear()
+        self._tags_pulse_hold_timer.stop()
+        self._tags_pulse_fail_safe_timer.stop()
         self._fit_tags_table_columns(initial=False)
         self.status_label.setText('Статус: все регистры удалены из таблицы')
 
@@ -4357,18 +4583,19 @@ class MainWindow(QMainWindow):
         )
 
     def _open_tags_client(self) -> ModbusTcpClient | None:
+        host, port, _unit_id, timeout_s, _offset, _retries = self._effective_local_modbus_settings()
         client = ModbusTcpClient(
-            host=self.current_profile.ip,
-            port=self.current_profile.port,
-            timeout=self.current_profile.timeout_s,
+            host=host,
+            port=port,
+            timeout=timeout_s,
         )
         try:
             ok = bool(client.connect())
         except Exception as exc:
-            self.status_label.setText(f"Ошибка: подключение к {self.current_profile.ip}:{self.current_profile.port} не удалось")
+            self.status_label.setText(f"Ошибка: подключение к {host}:{port} не удалось")
             return None
         if not ok:
-            self.status_label.setText(f"Ошибка: подключение к {self.current_profile.ip}:{self.current_profile.port} не удалось")
+            self.status_label.setText(f"Ошибка: подключение к {host}:{port} не удалось")
             return None
         return client
 
@@ -4392,8 +4619,9 @@ class MainWindow(QMainWindow):
         unit_id: int | None = None,
         address_offset: int | None = None,
     ) -> float:
-        uid = int(self.current_profile.unit_id if unit_id is None else unit_id)
-        offset = int(self.current_profile.address_offset if address_offset is None else address_offset)
+        _host, _port, default_unit_id, _timeout_s, default_offset, _retries = self._effective_local_modbus_settings()
+        uid = int(default_unit_id if unit_id is None else unit_id)
+        offset = int(default_offset if address_offset is None else address_offset)
         address = max(0, int(tag.address) + int(offset))
         count = 2 if tag.data_type == "float32" else 1
         if tag.register_type == "input":
@@ -4413,8 +4641,9 @@ class MainWindow(QMainWindow):
         unit_id: int | None = None,
         address_offset: int | None = None,
     ) -> None:
-        uid = int(self.current_profile.unit_id if unit_id is None else unit_id)
-        offset = int(self.current_profile.address_offset if address_offset is None else address_offset)
+        _host, _port, default_unit_id, _timeout_s, default_offset, _retries = self._effective_local_modbus_settings()
+        uid = int(default_unit_id if unit_id is None else unit_id)
+        offset = int(default_offset if address_offset is None else address_offset)
         if tag.register_type == "input":
             raise RuntimeError('Input-регистры доступны только для чтения')
         address = max(0, int(tag.address) + int(offset))
@@ -4471,6 +4700,7 @@ class MainWindow(QMainWindow):
                 "data_type": str(tag.data_type),
                 "bit_index": int(tag.bit_index),
                 "float_order": str(tag.float_order),
+                **self._source_modbus_request_overrides(source),
             },
             timeout_s=1.5,
         )
@@ -4509,6 +4739,7 @@ class MainWindow(QMainWindow):
                 "bit_index": int(tag.bit_index),
                 "float_order": str(tag.float_order),
                 "value": float(write_value),
+                **self._source_modbus_request_overrides(source),
             },
             timeout_s=1.5,
         )
@@ -4563,6 +4794,7 @@ class MainWindow(QMainWindow):
     ) -> tuple[dict[int, float], dict[int, str], str | None]:
         if not tags_by_row:
             return {}, {}, None
+        _host, _port, default_unit_id, _timeout_s, default_offset, default_retries = self._effective_local_modbus_settings()
         temp_items: list[object] = []
         for row, tag in tags_by_row:
             item = type("TagReadItem", (), {})()
@@ -4578,14 +4810,14 @@ class MainWindow(QMainWindow):
 
         specs = ModbusWorker._build_read_specs(
             temp_items,
-            address_offset=int(self.current_profile.address_offset if address_offset is None else address_offset),
+            address_offset=int(default_offset if address_offset is None else address_offset),
             default_scale=1.0,
         )
         values, errors, comm_error = ModbusWorker._read_specs_grouped(
             client,
             specs,
-            int(self.current_profile.unit_id if unit_id is None else unit_id),
-            read_attempts=max(1, int((self.current_profile.retries if retries is None else retries)) + 1),
+            int(default_unit_id if unit_id is None else unit_id),
+            read_attempts=max(1, int((default_retries if retries is None else retries)) + 1),
         )
         values_by_row: dict[int, float] = {}
         for key, entry in values.items():
@@ -4611,6 +4843,30 @@ class MainWindow(QMainWindow):
             comm_error_text = str(exc)
         return values_by_row, errors_by_row, comm_error_text
 
+    def _read_tags_individually_with_client(
+        self,
+        client: ModbusTcpClient,
+        tags_by_row: list[tuple[int, TagConfig]],
+        *,
+        unit_id: int | None = None,
+        address_offset: int | None = None,
+    ) -> tuple[dict[int, float], dict[int, str]]:
+        values_by_row: dict[int, float] = {}
+        errors_by_row: dict[int, str] = {}
+        for row, tag in tags_by_row:
+            try:
+                values_by_row[row] = float(
+                    self._read_single_tag(
+                        client,
+                        tag,
+                        unit_id=unit_id,
+                        address_offset=address_offset,
+                    )
+                )
+            except Exception as exc:
+                errors_by_row[row] = str(exc)
+        return values_by_row, errors_by_row
+
     def _read_tags_many_remote_batch(
         self,
         source: RecorderSourceConfig,
@@ -4633,7 +4889,10 @@ class MainWindow(QMainWindow):
                 source,
                 "POST",
                 "/v1/modbus/read_many",
-                payload={"items": payload_items},
+                payload={
+                    "items": payload_items,
+                    **self._source_modbus_request_overrides(source, include_read_attempts=True),
+                },
                 timeout_s=min(6.0, max(1.2, 0.02 * len(payload_items) + 1.0)),
             )
         except urlerror.HTTPError as exc:
@@ -4676,7 +4935,7 @@ class MainWindow(QMainWindow):
         return values_by_row, errors_by_row, comm_error_text
 
     def _read_tags_once(self, update_status: bool = True) -> tuple[int, int]:
-        source = self._selected_tags_source()
+        source = self._effective_tags_source_for_io()
         rows_to_read: list[tuple[int, TagConfig, QDoubleSpinBox]] = []
         for row in range(self.tags_table.rowCount()):
             tag = self._collect_tag_row(row)
@@ -4699,6 +4958,8 @@ class MainWindow(QMainWindow):
         errors_by_row: dict[int, str] = {}
         comm_error_text: str | None = None
         client: ModbusTcpClient | None = None
+        unit_id: int | None = None
+        address_offset: int | None = None
         if source is None:
             client = self._open_tags_client()
             if client is None:
@@ -4743,6 +5004,39 @@ class MainWindow(QMainWindow):
                     errors_by_row[row] = error_text
                 comm_error_text = error_text
 
+        # Reliability fallback for the Modbus register browser:
+        # if grouped batch reads fail for some rows, retry those rows one-by-one.
+        if (source is None or (source is not None and self._is_modbus_source(source))) and rows_to_read:
+            unresolved = [
+                (row, tag)
+                for row, tag, _spin in rows_to_read
+                if row not in values_by_row
+            ]
+            if unresolved:
+                retry_client: ModbusTcpClient | None = None
+                retry_unit_id = unit_id
+                retry_address_offset = address_offset
+                if source is None:
+                    retry_client = self._open_tags_client()
+                elif self._is_modbus_source(source):
+                    retry_client = self._open_tags_client_for_source(source)
+                if retry_client is not None:
+                    try:
+                        retry_values, retry_errors = self._read_tags_individually_with_client(
+                            retry_client,
+                            unresolved,
+                            unit_id=retry_unit_id,
+                            address_offset=retry_address_offset,
+                        )
+                        values_by_row.update(retry_values)
+                        for row, error_text in retry_errors.items():
+                            errors_by_row[row] = error_text
+                    finally:
+                        try:
+                            retry_client.close()
+                        except Exception:
+                            pass
+
         ok_count = 0
         fail_count = 0
         for row, tag, value_spin in rows_to_read:
@@ -4769,8 +5063,17 @@ class MainWindow(QMainWindow):
                 src_text = f"{source.name} [Modbus] ({host}:{port}, Unit {int(unit_id)})"
             else:
                 src_text = f"{source.name} ({source.host}:{source.port})"
+            first_error_text = ""
+            if fail_count > 0:
+                for row, _tag, _spin in rows_to_read:
+                    if row in errors_by_row:
+                        first_error_text = str(errors_by_row[row])
+                        break
+                if not first_error_text and comm_error_text:
+                    first_error_text = str(comm_error_text)
+            suffix = f", первая ошибка: {first_error_text}" if first_error_text else ""
             self.status_label.setText(
-                f"Статус: чтение регистров завершено [{src_text}] (успешно {ok_count}, ошибок {fail_count})"
+                f"Статус: чтение регистров завершено [{src_text}] (успешно {ok_count}, ошибок {fail_count}{suffix})"
             )
         return ok_count, fail_count
 
@@ -4779,7 +5082,7 @@ class MainWindow(QMainWindow):
             self._read_tags_once(update_status=True)
 
     def _on_write_tags_clicked(self, _checked: bool = False) -> None:
-        source = self._selected_tags_source()
+        source = self._effective_tags_source_for_io()
         client: ModbusTcpClient | None = None
         unit_id: int | None = None
         address_offset: int | None = None
@@ -5344,6 +5647,34 @@ class MainWindow(QMainWindow):
             enabled=True,
         )
 
+    def _local_modbus_proxy_source(self) -> RecorderSourceConfig | None:
+        source = self._local_recorder_api_source()
+        if source is None:
+            return None
+        if not self._is_external_recorder_running():
+            return None
+        return source
+
+    def _source_modbus_request_overrides(
+        self,
+        source: RecorderSourceConfig,
+        *,
+        include_read_attempts: bool = False,
+    ) -> dict[str, object]:
+        if str(getattr(source, "id", "") or "").strip() != "local-recorder-api":
+            return {}
+        host, port, unit_id, timeout_s, address_offset, retries = self._effective_local_modbus_settings()
+        payload: dict[str, object] = {
+            "host": host,
+            "port": int(port),
+            "unit_id": int(unit_id),
+            "timeout_s": float(timeout_s),
+            "address_offset": int(address_offset),
+        }
+        if include_read_attempts:
+            payload["read_attempts"] = max(1, int(retries) + 1)
+        return payload
+
     def _push_profile_to_local_recorder(self, silent: bool = True) -> bool:
         if not self._profile_uses_local_recorder():
             return True
@@ -5389,6 +5720,31 @@ class MainWindow(QMainWindow):
         main_path = Path(__file__).resolve().parents[1] / "main.py"
         return [sys.executable, str(main_path), "--recorder-tray"]
 
+    def _external_recorder_start_confirmed(self, previous_status_updated_at: str = "") -> bool:
+        if resolve_recorder_pid() is not None:
+            return True
+        status_payload = read_recorder_status() or {}
+        status_state = str(status_payload.get("state") or "").strip().lower()
+        status_updated_at = str(status_payload.get("updated_at") or "").strip()
+        if not status_updated_at or status_updated_at == str(previous_status_updated_at or "").strip():
+            return False
+        return status_state in {"starting", "running"}
+
+    def _wait_for_local_recorder_api_bootstrap(self, timeout_s: float = 2.5) -> bool:
+        if self._local_recorder_api_source() is None:
+            return False
+        deadline = time.monotonic() + max(0.2, float(timeout_s))
+        while time.monotonic() < deadline:
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+            if self._bootstrap_local_api_live_cursor():
+                return True
+            if not self._is_external_recorder_running():
+                return False
+            time.sleep(0.15)
+        return False
+
     def _start_external_recorder(self, _checked: bool = False, silent: bool = False) -> bool:
         self._store_ui_to_profile(self.current_profile)
         if not self._save_recorder_config_snapshot(silent=bool(silent)):
@@ -5400,6 +5756,10 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(f'Статус: внешний регистратор уже запущен (PID {pid})')
             self._update_recorder_dependent_ui_state()
             return True
+
+        status_before = read_recorder_status() or {}
+        prev_updated_at = str(status_before.get("updated_at") or "").strip()
+        clear_recorder_pid()
 
         try:
             cmd = self._external_recorder_command()
@@ -5414,6 +5774,8 @@ class MainWindow(QMainWindow):
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+            "env": _detached_process_env(),
         }
         if sys.platform == "win32":
             kwargs["creationflags"] = (
@@ -5430,20 +5792,26 @@ class MainWindow(QMainWindow):
             self._update_recorder_dependent_ui_state()
             return False
 
-        deadline = time.monotonic() + 6.0
+        deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
-            pid = resolve_recorder_pid()
-            if pid is not None:
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+            if self._external_recorder_start_confirmed(prev_updated_at):
+                pid = resolve_recorder_pid()
                 if not silent:
-                    self.status_label.setText(f'Статус: внешний регистратор запущен (PID {pid})')
+                    if pid is not None:
+                        self.status_label.setText(f'Статус: внешний регистратор запущен (PID {pid})')
+                    else:
+                        self.status_label.setText('Статус: внешний регистратор запускается')
                 self._update_recorder_dependent_ui_state()
                 return True
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         if not silent:
             self.status_label.setText('Статус: запуск регистратора выполнен, ожидание статуса')
         self._update_recorder_dependent_ui_state()
-        return resolve_recorder_pid() is not None
+        return self._external_recorder_start_confirmed(prev_updated_at)
 
 
     def _stop_external_recorder(self, _checked: bool = False) -> None:
@@ -6143,6 +6511,7 @@ class MainWindow(QMainWindow):
         self.recorder_api_host_edit.setText(str(profile.recorder_api_host or "0.0.0.0"))
         self.recorder_api_port_spin.setValue(max(1, min(65535, int(profile.recorder_api_port))))
         self.recorder_api_token_edit.setText(str(profile.recorder_api_token or ""))
+        self._update_connection_settings_visibility()
         self._apply_render_interval_runtime(profile.render_interval_ms)
         mode_index = self.mode_combo.findData(profile.work_mode)
         self.mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
@@ -8323,12 +8692,20 @@ class MainWindow(QMainWindow):
             if mode == "online":
                 auto_x_enabled = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else True
                 live_restore_span = self._lightweight_live_history_span_s()
-                self._load_recent_online_history_from_db(
-                    adjust_x_range=auto_x_enabled,
-                    silent=True,
-                    span_override_s=live_restore_span,
-                    signal_ids=active_signal_ids,
-                )
+                if self._should_use_local_api_history_in_online_mode():
+                    self._load_recent_local_api_history(
+                        live_restore_span,
+                        signal_ids=active_signal_ids,
+                        adjust_x_range=auto_x_enabled,
+                        silent=True,
+                    )
+                else:
+                    self._load_recent_online_history_from_db(
+                        adjust_x_range=auto_x_enabled,
+                        silent=True,
+                        span_override_s=live_restore_span,
+                        signal_ids=active_signal_ids,
+                    )
                 try:
                     x_left, x_right = self.chart.current_x_range()
                     span_s = max(10.0, float(x_right - x_left))
@@ -9399,6 +9776,26 @@ class MainWindow(QMainWindow):
         if self._history_view_timer.isActive():
             self._history_view_timer.stop()
 
+    def _reset_chart_runtime_history_state(self) -> None:
+        self._pending_render_samples = []
+        self._history_reload_guard = True
+        try:
+            self.chart.set_connection_events([])
+            self.chart.clear_data()
+        finally:
+            self._history_reload_guard = False
+        self._connection_events = []
+        self._last_connection_state = None
+        self._reset_history_window_cache()
+
+    def _should_use_local_api_history_in_online_mode(self) -> bool:
+        mode = str(self.mode_combo.currentData() or "online")
+        if mode != "online":
+            return False
+        if bool(getattr(self.current_profile, "archive_to_db", True)):
+            return False
+        return self._local_recorder_api_source() is not None
+
     def _target_history_points(self, span_s: float | None = None) -> int:
         try:
             width_px = int(self.chart.plot_widget.width())
@@ -9466,9 +9863,11 @@ class MainWindow(QMainWindow):
             if left >= float(loaded_left) and right <= float(loaded_right) and has_detail:
                 return
 
-        db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
-        if not db_path.exists():
-            return
+        use_local_api_history = self._should_use_local_api_history_in_online_mode()
+        if not use_local_api_history:
+            db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
+            if not db_path.exists():
+                return
 
         self._pending_history_x_range = (left, right)
         delay_ms = 1 if force else int(self._history_view_timer.interval())
@@ -9483,6 +9882,9 @@ class MainWindow(QMainWindow):
         if pending is None:
             return
         left, right = pending
+        if self._should_use_local_api_history_in_online_mode():
+            self._load_history_window_from_local_api(left, right, preserve_range=True, silent=True)
+            return
         self._load_history_window_from_db(left, right, preserve_range=True, silent=True)
 
     @staticmethod
@@ -9856,6 +10258,139 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Статус: загружен участок архива {left_text} .. {right_text}")
         return True
 
+    def _fetch_local_api_history_payload(
+        self,
+        start_ts: float,
+        end_ts: float,
+        signal_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[dict[str, list[list[float]]], list[list[float]]] | None:
+        source = self._local_recorder_api_source()
+        if source is None:
+            return None
+        tag_ids_csv = ",".join(sorted({str(item).strip() for item in list(signal_ids or set()) if str(item).strip()}))
+        try:
+            payload = self._source_request_json(
+                source,
+                "GET",
+                "/v1/history",
+                query={
+                    "from_ts": f"{float(start_ts):.3f}",
+                    "to_ts": f"{float(end_ts):.3f}",
+                    "tag_ids": tag_ids_csv if tag_ids_csv else None,
+                },
+                timeout_s=max(0.5, self._remote_live_timeout_s() * 2.0),
+            )
+        except Exception:
+            return None
+        if not bool(payload.get("ok", False)):
+            return None
+
+        samples_map: dict[str, list[list[float]]] = {}
+        raw_samples = payload.get("samples")
+        if isinstance(raw_samples, dict):
+            for signal_id, points in raw_samples.items():
+                sid = str(signal_id or "").strip()
+                if not sid or not isinstance(points, list):
+                    continue
+                normalized_points: list[list[float]] = []
+                for point in points:
+                    if not isinstance(point, (list, tuple)) or len(point) < 2:
+                        continue
+                    try:
+                        normalized_points.append([float(point[0]), float(point[1])])
+                    except (TypeError, ValueError):
+                        continue
+                normalized_points.sort(key=lambda item: float(item[0]))
+                if normalized_points:
+                    samples_map[sid] = normalized_points
+
+        raw_events = payload.get("connection_events")
+        connection_events: list[list[float]] = []
+        if isinstance(raw_events, list):
+            temp_events: list[list[float]] = []
+            for item in raw_events:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                try:
+                    temp_events.append([float(item[0]), float(int(item[1]))])
+                except (TypeError, ValueError):
+                    continue
+            connection_events = self._normalize_connection_events(temp_events)
+
+        return samples_map, connection_events
+
+    def _load_history_window_from_local_api(
+        self,
+        x_left: float,
+        x_right: float,
+        preserve_range: bool = True,
+        silent: bool = True,
+        signal_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> bool:
+        if not self._profile_uses_local_recorder():
+            return False
+
+        left = float(min(x_left, x_right))
+        right = float(max(x_left, x_right))
+        if right <= left:
+            return False
+
+        span = right - left
+        margin = max(1.0, span * 0.20)
+        query_left = max(0.0, left - margin)
+        query_right = right + margin
+        active_signal_ids = signal_ids
+        if active_signal_ids is None:
+            local_active_ids = self._collect_active_signal_ids()
+            active_signal_ids = local_active_ids if local_active_ids else None
+        payload = self._fetch_local_api_history_payload(query_left, query_right, active_signal_ids)
+        if payload is None:
+            return False
+        samples_map, connection_events = payload
+
+        has_any_points = self._samples_payload_has_points(samples_map)
+        has_connection_events = bool(connection_events)
+        if not has_any_points and not has_connection_events:
+            return False
+
+        signal_name_by_id = {str(item.id): str(item.name) for item in self.current_profile.signals if str(item.id)}
+        latest_values: dict[str, tuple[str, float]] = {}
+        for sid, points in samples_map.items():
+            if not points:
+                continue
+            try:
+                latest_values[str(sid)] = (signal_name_by_id.get(str(sid), str(sid)), float(points[-1][1]))
+            except Exception:
+                continue
+        if latest_values:
+            self._last_live_values.update(latest_values)
+
+        approx_bucket_s = max(1e-6, float(query_right - query_left) / float(max(32, self._target_history_points(span_s=span))))
+        self._history_reload_guard = True
+        try:
+            self.chart.set_archive_data(samples_map)
+            self.chart.set_connection_events(connection_events)
+            if preserve_range:
+                try:
+                    view_left, view_right = self.chart.current_x_range()
+                except Exception:
+                    view_left, view_right = float(left), float(right)
+                if abs(float(view_left) - float(left)) > 1e-6 or abs(float(view_right) - float(right)) > 1e-6:
+                    self.chart.set_x_range(float(left), float(right))
+        finally:
+            self._history_reload_guard = False
+
+        self._connection_events = connection_events
+        self._last_connection_state = None if not connection_events else bool(int(connection_events[-1][1]))
+        self._history_loaded_range = (float(query_left), float(query_right))
+        self._history_loaded_bucket_s = approx_bucket_s
+
+        if not silent:
+            left_text = format_ts_ms(float(left))
+            right_text = format_ts_ms(float(right))
+            self.status_label.setText(f"Статус: загружен live-участок {left_text} .. {right_text}")
+        return True
+
     def _load_offline_initial_history_from_db(self, silent: bool = True) -> bool:
         if not self._profile_uses_local_recorder():
             return False
@@ -9978,6 +10513,8 @@ class MainWindow(QMainWindow):
         span_override_s: float | None = None,
         signal_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> bool:
+        if not bool(getattr(self.current_profile, "archive_to_db", True)):
+            return False
         db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
         if not db_path.exists():
             return False
@@ -10244,6 +10781,122 @@ class MainWindow(QMainWindow):
             self._local_api_live_cursor = {"sample_id": 0, "event_id": 0}
         return True
 
+    def _cancel_local_live_future(self) -> None:
+        future = self._local_live_future
+        self._local_live_future = None
+        if future is None:
+            return
+        try:
+            future.cancel()
+        except Exception:
+            pass
+
+    def _reset_local_live_async_state(self) -> None:
+        self._cancel_local_live_future()
+        self._local_live_backoff_until_mono = 0.0
+        self._local_live_fail_count = 0
+        self._local_last_ok_mono = None
+
+    def _local_live_connected_stable(self, now_mono: float) -> bool:
+        last_ok = self._local_last_ok_mono
+        if last_ok is None:
+            return False
+        ttl_s = max(2.0, float(self._db_live_timer.interval()) / 1000.0 * 4.0)
+        return (now_mono - float(last_ok)) <= ttl_s
+
+    def _local_live_fetch_api_payload(
+        self,
+        source: RecorderSourceConfig,
+        since_sample_id: int,
+        since_event_id: int,
+        timeout_s: float,
+    ) -> dict:
+        try:
+            payload = self._source_request_json(
+                source,
+                "GET",
+                "/v1/live",
+                query={
+                    "since_sample_id": int(since_sample_id),
+                    "since_event_id": int(since_event_id),
+                    "sample_limit": 4000,
+                    "event_limit": 2000,
+                },
+                timeout_s=float(timeout_s),
+            )
+            return {
+                "ok": True,
+                "kind": "api",
+                "payload": payload,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "kind": "api",
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _local_live_fetch_db_payload(
+        db_path: str,
+        profile_id: str,
+        since_sample_id: int,
+        since_event_id: int,
+    ) -> dict:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA busy_timeout=2000;")
+            sample_rows = conn.execute(
+                """
+                SELECT id, signal_id, ts, value
+                FROM samples
+                WHERE profile_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT 12000
+                """,
+                (str(profile_id), int(since_sample_id)),
+            ).fetchall()
+            connection_rows = conn.execute(
+                """
+                SELECT id, ts, is_connected
+                FROM connection_events
+                WHERE profile_id = ? AND id > ?
+                ORDER BY id ASC
+                LIMIT 4000
+                """,
+                (str(profile_id), int(since_event_id)),
+            ).fetchall()
+            return {
+                "ok": True,
+                "kind": "db",
+                "sample_rows": sample_rows,
+                "connection_rows": connection_rows,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "kind": "db",
+                "error": str(exc),
+            }
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _local_recorder_connected_from_status(self) -> bool:
+        if not self._is_external_recorder_running():
+            return False
+        status_payload = read_recorder_status() or {}
+        if str(status_payload.get("profile_id") or "") != str(self.current_profile.id):
+            return False
+        try:
+            return bool(status_payload.get("connected", False))
+        except Exception:
+            return False
+
     def _append_local_api_samples_rows(self, rows: list[dict]) -> None:
         if not rows:
             return
@@ -10333,54 +10986,140 @@ class MainWindow(QMainWindow):
             pass
         return bool(payload.get("connected", False))
 
-    def _load_recent_local_api_history(self, span_s: float, signal_ids: set[str] | None = None) -> bool:
-        source = self._local_recorder_api_source()
-        if source is None or span_s <= 0.0:
+    def _poll_local_live_stream_async(self) -> bool:
+        transport = str(getattr(self, "_local_live_transport", "none") or "none")
+        if transport not in {"api", "db"}:
+            self._reset_local_live_async_state()
+            return False
+
+        source = self._local_recorder_api_source() if transport == "api" else None
+        if transport == "api" and source is None:
+            self._reset_local_live_async_state()
+            return False
+        if transport == "db" and not bool(getattr(self.current_profile, "archive_to_db", True)):
+            self._reset_local_live_async_state()
+            return False
+
+        now_mono = time.monotonic()
+        any_ok_now = False
+        future = self._local_live_future
+
+        if future is not None and future.done():
+            self._local_live_future = None
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {"ok": False, "kind": transport, "error": str(exc)}
+
+            request_ok = bool(isinstance(result, dict) and result.get("ok", False))
+            result_kind = str(result.get("kind") or transport) if isinstance(result, dict) else transport
+
+            if request_ok and result_kind == "api":
+                payload = result.get("payload") if isinstance(result, dict) else None
+                payload_ok = bool(isinstance(payload, dict) and payload.get("ok", False))
+                if payload_ok:
+                    connected_now = bool(payload.get("connected", False))
+                    if connected_now:
+                        any_ok_now = True
+                        self._local_last_ok_mono = now_mono
+                    else:
+                        self._local_last_ok_mono = None
+                    self._local_live_fail_count = 0
+                    self._local_live_backoff_until_mono = now_mono
+                    sample_rows = payload.get("samples")
+                    if isinstance(sample_rows, list):
+                        self._append_local_api_samples_rows(sample_rows)
+                    connection_rows = payload.get("connection_events")
+                    if isinstance(connection_rows, list):
+                        self._append_live_connection_event_payload(connection_rows)
+                    try:
+                        self._local_api_live_cursor["sample_id"] = int(
+                            payload.get("next_sample_id", self._local_api_live_cursor.get("sample_id", 0)) or 0
+                        )
+                        self._local_api_live_cursor["event_id"] = int(
+                            payload.get("next_event_id", self._local_api_live_cursor.get("event_id", 0)) or 0
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                else:
+                    request_ok = False
+            elif request_ok and result_kind == "db":
+                sample_rows = result.get("sample_rows")
+                if isinstance(sample_rows, list) and sample_rows:
+                    try:
+                        self._db_live_last_sample_row_id = int(sample_rows[-1][0])
+                    except Exception:
+                        pass
+                    self._append_db_live_sample_rows(sample_rows)
+                connection_rows = result.get("connection_rows")
+                if isinstance(connection_rows, list) and connection_rows:
+                    try:
+                        self._db_live_last_connection_event_row_id = int(connection_rows[-1][0])
+                    except Exception:
+                        pass
+                    self._append_db_live_connection_rows(connection_rows)
+                connected_now = self._local_recorder_connected_from_status()
+                if connected_now:
+                    any_ok_now = True
+                    self._local_last_ok_mono = now_mono
+                else:
+                    self._local_last_ok_mono = None
+                self._local_live_fail_count = 0
+                self._local_live_backoff_until_mono = now_mono
+            else:
+                request_ok = False
+
+            if not request_ok:
+                fail_count = int(self._local_live_fail_count) + 1
+                self._local_live_fail_count = fail_count
+                backoff_s = min(3.0, 0.25 * (2 ** max(0, fail_count - 1)))
+                self._local_live_backoff_until_mono = now_mono + backoff_s
+
+        executor = self._remote_live_executor
+        if executor is not None and self._local_live_future is None:
+            due_at = float(self._local_live_backoff_until_mono or 0.0)
+            if now_mono >= due_at:
+                if transport == "api" and source is not None:
+                    source_copy = RecorderSourceConfig.from_dict(source.to_dict())
+                    self._local_live_future = executor.submit(
+                        self._local_live_fetch_api_payload,
+                        source_copy,
+                        int(self._local_api_live_cursor.get("sample_id", 0)),
+                        int(self._local_api_live_cursor.get("event_id", 0)),
+                        float(max(0.35, self._remote_live_timeout_s())),
+                    )
+                elif transport == "db":
+                    db_path = Path(self.current_profile.db_path or str(DEFAULT_DB_PATH))
+                    if db_path.exists():
+                        self._local_live_future = executor.submit(
+                            self._local_live_fetch_db_payload,
+                            str(db_path),
+                            str(self.current_profile.id),
+                            int(self._db_live_last_sample_row_id),
+                            int(self._db_live_last_connection_event_row_id),
+                        )
+
+        return self._local_live_connected_stable(now_mono) or any_ok_now
+
+    def _load_recent_local_api_history(
+        self,
+        span_s: float,
+        signal_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        *,
+        adjust_x_range: bool = True,
+        silent: bool = True,
+    ) -> bool:
+        if span_s <= 0.0:
             return False
         end_ts = time.time()
         start_ts = max(0.0, end_ts - float(span_s))
-        tag_ids_csv = ",".join(sorted({str(item).strip() for item in list(signal_ids or set()) if str(item).strip()}))
-        try:
-            payload = self._source_request_json(
-                source,
-                "GET",
-                "/v1/history",
-                query={
-                    "from_ts": f"{start_ts:.3f}",
-                    "to_ts": f"{end_ts:.3f}",
-                    "tag_ids": tag_ids_csv if tag_ids_csv else None,
-                },
-                timeout_s=max(0.5, self._remote_live_timeout_s() * 2.0),
-            )
-        except Exception:
-            return False
-        if not bool(payload.get("ok", False)):
-            return False
-        rows: list[dict] = []
-        raw_samples = payload.get("samples")
-        if isinstance(raw_samples, dict):
-            for signal_id, points in raw_samples.items():
-                if not isinstance(points, list):
-                    continue
-                for point in points:
-                    if not isinstance(point, (list, tuple)) or len(point) < 2:
-                        continue
-                    rows.append({"tag_id": str(signal_id), "ts": point[0], "value": point[1]})
-        rows.sort(key=lambda item: float(item.get("ts", 0.0)))
-        if rows:
-            self._append_local_api_samples_rows(rows)
-        loaded_events = False
-        connection_rows = payload.get("connection_events")
-        if isinstance(connection_rows, list):
-            event_payload = []
-            for item in connection_rows:
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    continue
-                event_payload.append({"ts": item[0], "is_connected": item[1]})
-            if event_payload:
-                self._append_live_connection_event_payload(event_payload)
-                loaded_events = True
-        return bool(rows) or bool(loaded_events)
+        return self._load_history_window_from_local_api(
+            start_ts,
+            end_ts,
+            preserve_range=bool(adjust_x_range),
+            silent=silent,
+            signal_ids=signal_ids,
+        )
 
     def _remote_signal_mapping(
         self,
@@ -11125,56 +11864,7 @@ class MainWindow(QMainWindow):
 
         local_connected = False
         if self._local_live_enabled:
-            if bool(getattr(self.current_profile, "archive_to_db", True)):
-                conn = None
-                if self._open_db_live_connection():
-                    conn = self._db_live_conn
-
-                if conn is not None:
-                    try:
-                        sample_rows = conn.execute(
-                            """
-                            SELECT id, signal_id, ts, value
-                            FROM samples
-                            WHERE profile_id = ? AND id > ?
-                            ORDER BY id ASC
-                            LIMIT 12000
-                            """,
-                            (self.current_profile.id, int(self._db_live_last_sample_row_id)),
-                        ).fetchall()
-                        if sample_rows:
-                            self._db_live_last_sample_row_id = int(sample_rows[-1][0])
-                            self._append_db_live_sample_rows(sample_rows)
-
-                        connection_rows = conn.execute(
-                            """
-                            SELECT id, ts, is_connected
-                            FROM connection_events
-                            WHERE profile_id = ? AND id > ?
-                            ORDER BY id ASC
-                            LIMIT 4000
-                            """,
-                            (self.current_profile.id, int(self._db_live_last_connection_event_row_id)),
-                        ).fetchall()
-                        if connection_rows:
-                            self._db_live_last_connection_event_row_id = int(connection_rows[-1][0])
-                            self._append_db_live_connection_rows(connection_rows)
-                    except Exception:
-                        self._close_db_live_connection()
-                        conn = None
-
-                if conn is not None:
-                    if not self._is_external_recorder_running():
-                        local_connected = False
-                    else:
-                        status_payload = read_recorder_status() or {}
-                        if str(status_payload.get("profile_id") or "") == str(self.current_profile.id):
-                            try:
-                                local_connected = bool(status_payload.get("connected", False))
-                            except Exception:
-                                local_connected = False
-            else:
-                local_connected = self._poll_local_recorder_live_api()
+            local_connected = self._poll_local_live_stream_async()
 
         remote_connected = self._poll_remote_live_stream()
         connected_now = bool(local_connected or remote_connected)
@@ -11237,6 +11927,10 @@ class MainWindow(QMainWindow):
         self._last_live_values = {}
         self._live_cycle_has_new_samples = False
         self._last_ui_heartbeat_ts = 0.0
+        self._local_live_transport = "none"
+        self._reset_local_live_async_state()
+        if bool(self.current_profile.render_chart_enabled):
+            self._reset_chart_runtime_history_state()
 
         auto_applied_remote, auto_failed_remote = self._auto_sync_remote_profiles_for_live()
         if auto_applied_remote > 0:
@@ -11260,8 +11954,14 @@ class MainWindow(QMainWindow):
         )
         has_remote_stream = bool(self._remote_signal_mapping(only_enabled=True))
         self._local_live_enabled = bool(needs_local_stream)
-        local_db_live_enabled = bool(self._local_live_enabled and bool(getattr(self.current_profile, "archive_to_db", True)))
-        local_api_live_enabled = bool(self._local_live_enabled and not local_db_live_enabled)
+        local_api_source = self._local_recorder_api_source() if self._local_live_enabled else None
+        # Prefer recorder API for local realtime samples even when archive
+        # writing is enabled. If API is not ready yet during the very first
+        # startup click, we can temporarily fall back to DB live instead of
+        # forcing the user to press Start again.
+        prefer_local_api_live = bool(self._local_live_enabled and local_api_source is not None)
+        local_api_live_enabled = False
+        local_db_live_enabled = False
 
         if self._local_live_enabled and not self._is_external_recorder_running():
             started = self._start_external_recorder(silent=True)
@@ -11280,6 +11980,15 @@ class MainWindow(QMainWindow):
                 self._update_recorder_dependent_ui_state()
                 return
 
+        if self._local_live_enabled:
+            if prefer_local_api_live:
+                local_api_live_enabled = self._wait_for_local_recorder_api_bootstrap(timeout_s=2.5)
+            local_db_live_enabled = bool(
+                self._local_live_enabled
+                and not local_api_live_enabled
+                and bool(getattr(self.current_profile, "archive_to_db", True))
+            )
+
         if local_db_live_enabled:
             self._close_db_live_connection()
             if not self._open_db_live_connection():
@@ -11294,17 +12003,18 @@ class MainWindow(QMainWindow):
         else:
             self._close_db_live_connection()
             if local_api_live_enabled:
-                if self._local_recorder_api_source() is None:
-                    if has_remote_stream:
-                        self._local_live_enabled = False
-                        self.status_label.setText(
-                            'Статус: локальный recorder API выключен, запущен только удаленный live-поток'
-                        )
-                    else:
-                        self.status_label.setText('Ошибка: для live без БД нужен включенный API локального recorder')
-                        return
+                pass
+            elif self._local_live_enabled:
+                if has_remote_stream:
+                    self._local_live_enabled = False
+                    self.status_label.setText(
+                        'Статус: локальный live недоступен, запущен только удаленный live-поток'
+                    )
                 else:
-                    self._bootstrap_local_api_live_cursor()
+                    self.status_label.setText(
+                        'Ошибка: для локального live нужен включенный recorder API или архив БД'
+                    )
+                    return
 
         restored = False
         active_signal_ids = set(self._collect_active_signal_ids())
@@ -11325,6 +12035,8 @@ class MainWindow(QMainWindow):
             restored = self._load_recent_local_api_history(
                 max(10.0, float(history_span_s or 120.0)),
                 signal_ids=active_signal_ids,
+                adjust_x_range=True,
+                silent=True,
             )
             self._load_recent_remote_history_from_sources(
                 max(10.0, float(history_span_s or 120.0)),
@@ -11346,10 +12058,16 @@ class MainWindow(QMainWindow):
 
         if local_db_live_enabled:
             self._bootstrap_db_live_cursors()
+            self._close_db_live_connection()
+            self._local_live_transport = "db"
         else:
             self._db_live_last_sample_row_id = 0
             self._db_live_last_connection_event_row_id = 0
             self._bootstrap_remote_live_cursors()
+            if local_api_live_enabled:
+                self._local_live_transport = "api"
+            else:
+                self._local_live_transport = "none"
         self._db_live_running = True
         self._db_live_timer.setInterval(max(120, min(2000, int(self.current_profile.poll_interval_ms))))
         if not self._db_live_timer.isActive():
@@ -11364,8 +12082,10 @@ class MainWindow(QMainWindow):
         self._sync_run_state_actions()
         self._poll_db_live_stream()
         self._update_recorder_dependent_ui_state()
-        if local_db_live_enabled:
-            self.status_label.setText('Статус: просмотр из БД запущен')
+        if local_api_live_enabled:
+            self.status_label.setText('Статус: live-просмотр через recorder API запущен')
+        elif local_db_live_enabled:
+            self.status_label.setText('Статус: live-просмотр из БД запущен')
         else:
             self.status_label.setText('Статус: live-просмотр без архива запущен')
 
@@ -11374,7 +12094,9 @@ class MainWindow(QMainWindow):
             self._db_live_timer.stop()
         self._db_live_running = False
         self._local_live_enabled = True
+        self._local_live_transport = "none"
         self._local_api_live_cursor = {"sample_id": 0, "event_id": 0}
+        self._reset_local_live_async_state()
         self._remote_live_cursors = {}
         self._last_live_values = {}
         self._live_cycle_has_new_samples = False
@@ -11441,6 +12163,8 @@ class MainWindow(QMainWindow):
 
     def _on_chart_auto_mode_changed(self, auto_x: bool, auto_y: bool) -> None:
         prev_auto_x = bool(self.action_auto_x.isChecked()) if hasattr(self, "action_auto_x") else bool(auto_x)
+        prev_auto_y = bool(self.action_auto_y.isChecked()) if hasattr(self, "action_auto_y") else bool(auto_y)
+        updating_ui = bool(getattr(self, "_updating_ui", False))
         self.action_auto_x.blockSignals(True)
         self.action_auto_x.setChecked(auto_x)
         self.action_auto_x.blockSignals(False)
@@ -11456,9 +12180,12 @@ class MainWindow(QMainWindow):
             self.values_auto_y_checkbox.blockSignals(True)
             self.values_auto_y_checkbox.setChecked(bool(auto_y))
             self.values_auto_y_checkbox.blockSignals(False)
-        if prev_auto_x != bool(auto_x):
+        auto_x_changed = prev_auto_x != bool(auto_x)
+        auto_y_changed = prev_auto_y != bool(auto_y)
+        if auto_x_changed:
             self._handle_auto_x_runtime_change(bool(auto_x))
-        self._mark_config_dirty()
+        if not updating_ui and (auto_x_changed or auto_y_changed):
+            self._mark_config_dirty()
 
     def _on_chart_cursor_enabled_changed(self, enabled: bool) -> None:
         state = bool(enabled)
@@ -11891,6 +12618,7 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def _shutdown_remote_live_executor(self) -> None:
+        self._cancel_local_live_future()
         for future in list(self._remote_live_futures.values()):
             try:
                 future.cancel()

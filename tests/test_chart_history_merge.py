@@ -23,6 +23,19 @@ class ChartHistoryMergeTests(unittest.TestCase):
         self.assertEqual(xs, [10.0, 20.0, 30.0, 40.0])
         self.assertEqual(ys, [1.0, 2.0, 33.0, 4.0])
 
+    def test_causal_smoothing_keeps_existing_points_stable_when_new_samples_arrive(self) -> None:
+        base = MultiAxisChart._smooth_series_moving_average([1.0, 2.0, 100.0], 3, causal=True)
+        extended = MultiAxisChart._smooth_series_moving_average([1.0, 2.0, 100.0, 100.0], 3, causal=True)
+
+        self.assertEqual(base, extended[:3])
+
+    def test_centered_smoothing_uses_future_samples_but_causal_does_not(self) -> None:
+        centered = MultiAxisChart._smooth_series_moving_average([0.0, 0.0, 10.0], 3, causal=False)
+        causal = MultiAxisChart._smooth_series_moving_average([0.0, 0.0, 10.0], 3, causal=True)
+
+        self.assertGreater(centered[1], causal[1])
+        self.assertEqual(causal[1], 0.0)
+
 
 class HistoryPayloadTests(unittest.TestCase):
     def test_samples_payload_has_points_detects_non_empty_rows(self) -> None:

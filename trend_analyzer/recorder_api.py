@@ -192,112 +192,15 @@ class RecorderApiServer:
                     sample_limit = _safe_int((query.get("sample_limit") or [None])[0], 6000, minimum=1, maximum=50000)
                     event_limit = _safe_int((query.get("event_limit") or [None])[0], 3000, minimum=1, maximum=20000)
                     bootstrap = _safe_int((query.get("bootstrap") or [None])[0], 0, minimum=0, maximum=1) == 1
-                    profile = outer._service.get_runtime_profile()
-                    if not bool(getattr(profile, "archive_to_db", True)):
-                        payload = outer._service.get_live_stream_payload(
-                            since_sample_id=int(since_sample_id),
-                            since_event_id=int(since_event_id),
-                            sample_limit=int(sample_limit),
-                            event_limit=int(event_limit),
-                            bootstrap=bool(bootstrap),
-                        )
-                        payload["format"] = API_FORMAT
-                        self._send_json(HTTPStatus.OK, payload)
-                        return
-                    try:
-                        conn = self._db_connect()
-                    except Exception as exc:
-                        self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
-                        return
-                    try:
-                        if bootstrap:
-                            sample_row = conn.execute(
-                                "SELECT MAX(id) FROM samples WHERE profile_id = ?",
-                                (profile.id,),
-                            ).fetchone()
-                            event_row = conn.execute(
-                                "SELECT MAX(id) FROM connection_events WHERE profile_id = ?",
-                                (profile.id,),
-                            ).fetchone()
-                            self._send_json(
-                                HTTPStatus.OK,
-                                {
-                                    "ok": True,
-                                    "format": API_FORMAT,
-                                    "profile_id": profile.id,
-                                    "connected": bool(outer._service.build_health_payload(outer.bind_host, outer.port).get("connected", False)),
-                                    "samples": [],
-                                    "connection_events": [],
-                                    "next_sample_id": int(sample_row[0] or 0) if sample_row else 0,
-                                    "next_event_id": int(event_row[0] or 0) if event_row else 0,
-                                    "server_ts": time.time(),
-                                },
-                            )
-                            return
-
-                        name_rows = conn.execute(
-                            """
-                            SELECT signal_id, signal_name
-                            FROM signals_meta
-                            WHERE profile_id = ?
-                            """,
-                            (profile.id,),
-                        ).fetchall()
-                        names = {str(item[0]): str(item[1]) for item in name_rows}
-
-                        sample_rows = conn.execute(
-                            """
-                            SELECT id, signal_id, ts, value
-                            FROM samples
-                            WHERE profile_id = ? AND id > ?
-                            ORDER BY id ASC
-                            LIMIT ?
-                            """,
-                            (profile.id, int(since_sample_id), int(sample_limit)),
-                        ).fetchall()
-                        event_rows = conn.execute(
-                            """
-                            SELECT id, ts, is_connected
-                            FROM connection_events
-                            WHERE profile_id = ? AND id > ?
-                            ORDER BY id ASC
-                            LIMIT ?
-                            """,
-                            (profile.id, int(since_event_id), int(event_limit)),
-                        ).fetchall()
-                    finally:
-                        conn.close()
-
-                    samples_payload = [
-                        {
-                            "id": int(row_id),
-                            "tag_id": str(tag_id),
-                            "tag_name": names.get(str(tag_id), str(tag_id)),
-                            "ts": float(ts),
-                            "value": float(value),
-                        }
-                        for row_id, tag_id, ts, value in sample_rows
-                    ]
-                    events_payload = [
-                        {"id": int(row_id), "ts": float(ts), "is_connected": int(is_connected)}
-                        for row_id, ts, is_connected in event_rows
-                    ]
-                    next_sample_id = int(samples_payload[-1]["id"]) if samples_payload else int(since_sample_id)
-                    next_event_id = int(events_payload[-1]["id"]) if events_payload else int(since_event_id)
-                    self._send_json(
-                        HTTPStatus.OK,
-                        {
-                            "ok": True,
-                            "format": API_FORMAT,
-                            "profile_id": profile.id,
-                            "connected": bool(outer._service.build_health_payload(outer.bind_host, outer.port).get("connected", False)),
-                            "samples": samples_payload,
-                            "connection_events": events_payload,
-                            "next_sample_id": next_sample_id,
-                            "next_event_id": next_event_id,
-                            "server_ts": time.time(),
-                        },
+                    payload = outer._service.get_live_stream_payload(
+                        since_sample_id=int(since_sample_id),
+                        since_event_id=int(since_event_id),
+                        sample_limit=int(sample_limit),
+                        event_limit=int(event_limit),
+                        bootstrap=bool(bootstrap),
                     )
+                    payload["format"] = API_FORMAT
+                    self._send_json(HTTPStatus.OK, payload)
                     return
 
                 if path == "/v1/history":
@@ -431,7 +334,28 @@ class RecorderApiServer:
         return Handler
 
 
-def api_modbus_read(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def _ensure_modbus_client_connected(client: ModbusTcpClient, host: str, port: int) -> tuple[bool, str]:
+    try:
+        connected = bool(getattr(client, "connected", False))
+    except Exception:
+        connected = False
+    if connected:
+        return True, ""
+    try:
+        connected = bool(client.connect())
+    except Exception as exc:
+        return False, str(exc)
+    if not connected:
+        return False, f"connect_failed {host}:{port}"
+    return True, ""
+
+
+def api_modbus_read(
+    profile: ProfileConfig,
+    payload: dict[str, Any],
+    *,
+    client: ModbusTcpClient | None = None,
+) -> tuple[bool, dict[str, Any]]:
     register_type = str(payload.get("register_type") or "holding")
     data_type = str(payload.get("data_type") or "int16")
     float_order = str(payload.get("float_order") or "ABCD")
@@ -444,10 +368,13 @@ def api_modbus_read(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[bo
     host = str(payload.get("host") or profile.ip)
     port = _safe_int(str(payload.get("port") if payload.get("port") is not None else profile.port), profile.port, minimum=1, maximum=65535)
 
-    client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
+    owns_client = client is None
+    if client is None:
+        client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
     try:
-        if not client.connect():
-            return False, {"error": f"connect_failed {host}:{port}"}
+        ok, error = _ensure_modbus_client_connected(client, host, port)
+        if not ok:
+            return False, {"error": error}
         if count > 1:
             addr = max(0, int(address) + int(address_offset))
             if register_type == "input":
@@ -471,13 +398,19 @@ def api_modbus_read(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[bo
     except Exception as exc:
         return False, {"error": str(exc)}
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        if owns_client:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
-def api_modbus_read_many(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def api_modbus_read_many(
+    profile: ProfileConfig,
+    payload: dict[str, Any],
+    *,
+    client: ModbusTcpClient | None = None,
+) -> tuple[bool, dict[str, Any]]:
     raw_items = payload.get("items")
     if not isinstance(raw_items, list):
         return False, {"error": "items_missing"}
@@ -531,10 +464,13 @@ def api_modbus_read_many(profile: ProfileConfig, payload: dict[str, Any]) -> tup
     if not temp_items:
         return False, {"error": "items_invalid"}
 
-    client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
+    owns_client = client is None
+    if client is None:
+        client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
     try:
-        if not client.connect():
-            return False, {"error": f"connect_failed {host}:{port}"}
+        ok, error = _ensure_modbus_client_connected(client, host, port)
+        if not ok:
+            return False, {"error": error}
 
         specs = ModbusWorker._build_read_specs(temp_items, address_offset=address_offset, default_scale=1.0)
         values, errors, comm_error = ModbusWorker._read_specs_grouped(
@@ -571,13 +507,19 @@ def api_modbus_read_many(profile: ProfileConfig, payload: dict[str, Any]) -> tup
     except Exception as exc:
         return False, {"error": str(exc)}
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        if owns_client:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
-def api_modbus_write(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def api_modbus_write(
+    profile: ProfileConfig,
+    payload: dict[str, Any],
+    *,
+    client: ModbusTcpClient | None = None,
+) -> tuple[bool, dict[str, Any]]:
     register_type = str(payload.get("register_type") or "holding")
     data_type = str(payload.get("data_type") or "int16")
     float_order = str(payload.get("float_order") or "ABCD")
@@ -593,10 +535,13 @@ def api_modbus_write(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[b
     if register_type == "input":
         return False, {"error": "input_register_read_only"}
 
-    client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
+    owns_client = client is None
+    if client is None:
+        client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
     try:
-        if not client.connect():
-            return False, {"error": f"connect_failed {host}:{port}"}
+        ok, error = _ensure_modbus_client_connected(client, host, port)
+        if not ok:
+            return False, {"error": error}
 
         addr = max(0, int(address) + int(address_offset))
         if data_type == "int16":
@@ -629,7 +574,8 @@ def api_modbus_write(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[b
     except Exception as exc:
         return False, {"error": str(exc)}
     finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+        if owns_client:
+            try:
+                client.close()
+            except Exception:
+                pass

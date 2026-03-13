@@ -65,6 +65,8 @@ class RecorderService:
         self._last_metrics_refresh_mono = 0.0
         self._process = None
         self._live_lock = threading.RLock()
+        self._modbus_io_lock = threading.RLock()
+        self._poll_clients: dict[str, ModbusTcpClient] = {}
         self._live_sample_seq = 0
         self._live_event_seq = 0
         self._live_samples: deque[dict[str, Any]] = deque(maxlen=50000)
@@ -327,13 +329,88 @@ class RecorderService:
         return True, "applied"
 
     def api_modbus_read(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-        return api_modbus_read(self.get_runtime_profile(), payload)
+        profile = self.get_runtime_profile()
+        shared_result = self._call_shared_modbus_api(
+            profile,
+            payload,
+            lambda client: api_modbus_read(profile, payload, client=client),
+        )
+        if shared_result is not None:
+            return shared_result
+        return api_modbus_read(profile, payload)
 
     def api_modbus_read_many(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-        return api_modbus_read_many(self.get_runtime_profile(), payload)
+        profile = self.get_runtime_profile()
+        shared_result = self._call_shared_modbus_api(
+            profile,
+            payload,
+            lambda client: api_modbus_read_many(profile, payload, client=client),
+        )
+        if shared_result is not None:
+            return shared_result
+        return api_modbus_read_many(profile, payload)
 
     def api_modbus_write(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-        return api_modbus_write(self.get_runtime_profile(), payload)
+        profile = self.get_runtime_profile()
+        shared_result = self._call_shared_modbus_api(
+            profile,
+            payload,
+            lambda client: api_modbus_write(profile, payload, client=client),
+        )
+        if shared_result is not None:
+            return shared_result
+        return api_modbus_write(profile, payload)
+
+    @staticmethod
+    def _payload_modbus_endpoint(profile: ProfileConfig, payload: dict[str, Any]) -> tuple[str, int]:
+        host = str(payload.get("host") or profile.ip)
+        try:
+            port = int(payload.get("port") if payload.get("port") is not None else profile.port)
+        except Exception:
+            port = int(profile.port)
+        return host, max(1, min(65535, int(port)))
+
+    @classmethod
+    def _shared_modbus_source_key(cls, profile: ProfileConfig, payload: dict[str, Any]) -> str | None:
+        host, port = cls._payload_modbus_endpoint(profile, payload)
+        if host == str(profile.ip) and int(port) == int(profile.port):
+            return "local"
+        for source_id, source in cls._enabled_modbus_sources(profile).items():
+            source_host = str(getattr(source, "host", profile.ip) or profile.ip)
+            try:
+                source_port = int(getattr(source, "port", profile.port) or profile.port)
+            except Exception:
+                source_port = int(profile.port)
+            if host == source_host and int(port) == int(source_port):
+                return str(source_id)
+        return None
+
+    def _call_shared_modbus_api(
+        self,
+        profile: ProfileConfig,
+        payload: dict[str, Any],
+        callback,
+    ) -> tuple[bool, dict[str, Any]] | None:
+        source_key = self._shared_modbus_source_key(profile, payload)
+        if not source_key:
+            return None
+        host, port = self._payload_modbus_endpoint(profile, payload)
+        with self._modbus_io_lock:
+            client = self._poll_clients.get(str(source_key))
+            if client is None:
+                return None
+            try:
+                connected = bool(getattr(client, "connected", False))
+            except Exception:
+                connected = False
+            if not connected:
+                try:
+                    connected = bool(client.connect())
+                except Exception:
+                    connected = False
+            if not connected:
+                return None
+            return callback(client)
 
     def _start_api_server_if_enabled(self, profile: ProfileConfig) -> None:
         if not bool(profile.recorder_api_enabled):
@@ -387,7 +464,7 @@ class RecorderService:
         last_retention_vacuum_ts = 0.0
         archive_last_values: dict[str, float] = {}
         archive_last_written_ts: dict[str, float] = {}
-        clients: dict[str, ModbusTcpClient] = {}
+        clients = self._poll_clients
         client_signatures: dict[str, tuple[str, int, float]] = {}
         source_connected: dict[str, bool] = {}
 
@@ -442,16 +519,17 @@ class RecorderService:
                 active_source_ids = {
                     str(source_id) for (source_id, _host, _port, _unit, _timeout, _offset, _retries) in poll_groups.keys()
                 }
-                for source_id in list(clients.keys()):
-                    if source_id in active_source_ids:
-                        continue
-                    try:
-                        clients[source_id].close()
-                    except Exception:
-                        pass
-                    clients.pop(source_id, None)
-                    client_signatures.pop(source_id, None)
-                    source_connected.pop(source_id, None)
+                with self._modbus_io_lock:
+                    for source_id in list(clients.keys()):
+                        if source_id in active_source_ids:
+                            continue
+                        try:
+                            clients[source_id].close()
+                        except Exception:
+                            pass
+                        clients.pop(source_id, None)
+                        client_signatures.pop(source_id, None)
+                        source_connected.pop(source_id, None)
 
                 polled_signals = [signal for signals in poll_groups.values() for signal in signals]
                 signal_types_by_id = {
@@ -462,12 +540,13 @@ class RecorderService:
                 self._refresh_runtime_metrics(profile, store)
 
                 if not polled_signals:
-                    for source_id, source_client in list(clients.items()):
-                        try:
-                            source_client.close()
-                        except Exception:
-                            pass
-                        clients.pop(source_id, None)
+                    with self._modbus_io_lock:
+                        for source_id, source_client in list(clients.items()):
+                            try:
+                                source_client.close()
+                            except Exception:
+                                pass
+                            clients.pop(source_id, None)
                     client_signatures = {}
                     source_connected = {}
                     self._runtime_connected = False
@@ -488,38 +567,39 @@ class RecorderService:
                 for (source_id, host, port, unit_id, timeout_s, address_offset, retries), source_signals in poll_groups.items():
                     source_key = str(source_id or "local")
                     signature = (str(host), int(port), float(timeout_s))
-                    source_client = clients.get(source_key)
-                    if source_client is None or client_signatures.get(source_key) != signature:
-                        if source_client is not None:
-                            try:
-                                source_client.close()
-                            except Exception:
-                                pass
-                        source_client = ModbusTcpClient(host=str(host), port=int(port), timeout=float(timeout_s))
-                        clients[source_key] = source_client
-                        client_signatures[source_key] = signature
-                        source_connected[source_key] = False
-
-                    if not source_client.connected:
-                        try:
-                            source_connected[source_key] = bool(source_client.connect())
-                        except Exception as exc:
-                            source_connected[source_key] = False
-                            self._register_error(f"Connect failed [{source_key}] {host}:{int(port)}: {exc}")
-                    if not source_connected.get(source_key, False):
-                        continue
-
                     specs = ModbusWorker._build_read_specs(
                         source_signals,
                         address_offset=int(address_offset),
                         default_scale=1.0,
                     )
-                    group_samples, read_errors, comm_error = ModbusWorker._read_specs_grouped(
-                        source_client,
-                        specs,
-                        int(unit_id),
-                        read_attempts=max(1, int(retries) + 1),
-                    )
+                    with self._modbus_io_lock:
+                        source_client = clients.get(source_key)
+                        if source_client is None or client_signatures.get(source_key) != signature:
+                            if source_client is not None:
+                                try:
+                                    source_client.close()
+                                except Exception:
+                                    pass
+                            source_client = ModbusTcpClient(host=str(host), port=int(port), timeout=float(timeout_s))
+                            clients[source_key] = source_client
+                            client_signatures[source_key] = signature
+                            source_connected[source_key] = False
+
+                        if not source_client.connected:
+                            try:
+                                source_connected[source_key] = bool(source_client.connect())
+                            except Exception as exc:
+                                source_connected[source_key] = False
+                                self._register_error(f"Connect failed [{source_key}] {host}:{int(port)}: {exc}")
+                        if not source_connected.get(source_key, False):
+                            continue
+
+                        group_samples, read_errors, comm_error = ModbusWorker._read_specs_grouped(
+                            source_client,
+                            specs,
+                            int(unit_id),
+                            read_attempts=max(1, int(retries) + 1),
+                        )
                     endpoint = f"{host}:{int(port)}"
                     for spec, read_exc in read_errors:
                         address = int(spec.get("address", 0))
@@ -542,10 +622,11 @@ class RecorderService:
                             f"{data_type}/{spec.get('float_order', 'ABCD')}: {exc}"
                         )
                         source_connected[source_key] = False
-                        try:
-                            source_client.close()
-                        except Exception:
-                            pass
+                        with self._modbus_io_lock:
+                            try:
+                                source_client.close()
+                            except Exception:
+                                pass
                         continue
 
                     source_connected[source_key] = True
@@ -624,11 +705,13 @@ class RecorderService:
                 store.close()
             except Exception:
                 pass
-            for source_client in list(clients.values()):
-                try:
-                    source_client.close()
-                except Exception:
-                    pass
+            with self._modbus_io_lock:
+                for source_client in list(clients.values()):
+                    try:
+                        source_client.close()
+                    except Exception:
+                        pass
+                clients.clear()
 
     def _run_loop_legacy_single_source(self, profile: ProfileConfig) -> None:
         runtime_profile = self.get_runtime_profile()

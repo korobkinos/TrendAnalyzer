@@ -889,6 +889,17 @@
   - verification:
     - `python -m py_compile trend_analyzer/storage.py trend_analyzer/ui.py tests/test_storage_archive.py` -> OK
     - `.venv\\Scripts\\python -m unittest tests.test_storage_archive tests.test_chart_history_merge tests.test_ui_history_restore tests.test_ui_recorder_command tests.test_recorder_service tests.test_models_profile` -> OK
+- 2026-03-13 (Enter in connection settings no longer opens data-sources window):
+  - issue:
+    - in `Настройки подключения`, pressing `Enter` while editing IP/other fields could trigger `Источники данных...` instead of just confirming field editing.
+  - `trend_analyzer/ui.py`:
+    - disabled `autoDefault/default` on:
+      - `connection_manage_sources_btn`
+      - `apply_btn`
+      - `clear_archive_db_btn`
+    - profile-management buttons were already protected earlier; now the remaining connection-window actions are protected too.
+  - verification:
+    - `python -m py_compile trend_analyzer/ui.py` -> OK
 - 2026-03-12 (v1.5.19, live-start stabilization + full mojibake cleanup in ui.py):
   - scope:
     - this pass does **not** change archive schema logic (`storage.py` untouched),
@@ -915,3 +926,303 @@
   - verification:
     - `.venv\\Scripts\\python -m py_compile trend_analyzer\\ui.py trend_analyzer\\chart.py trend_analyzer\\history_restore.py` -> OK
     - `.venv\\Scripts\\python -m unittest discover -s tests` -> OK (`Ran 43 tests`)
+
+## 2026-03-13 - live-отрисовка не должна зависеть от частоты архивации
+
+- Проблема:
+  - при включенном локальном `TrendRecorder` и включенной записи в БД live-график в `TrendClient` читал локальные точки из таблицы `samples`, а не из `/v1/live`.
+  - из-за этого фактическая частота обновления экрана была привязана к `Частота архивации`, а не к `Частота опроса` + `Интервал отрисовки`.
+  - симптом: пользователь видел ступени и редкие обновления даже при `poll=100 ms`, `render=200 ms`.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - `_start_worker(...)` теперь предпочитает локальный recorder API для live-потока всегда, если API доступен.
+    - доступ к локальной БД оставлен как fallback только когда recorder API недоступен, но архив в БД включен.
+    - стартовый preload/live-status приведены к новой логике (`local_api_live_enabled` приоритетнее `local_db_live_enabled`).
+    - `_poll_db_live_stream(...)` теперь сначала берет локальный live через `/v1/live`, и только при отсутствии API использует DB-tail.
+
+- Ожидаемое поведение после фикса:
+  - значения на экран должны попадать с частотой, ограниченной в основном `max(Частота опроса, Интервал отрисовки)`.
+  - `Частота архивации` влияет только на запись в БД, но не должна тормозить live-отрисовку.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_recorder_service tests.test_ui_history_restore` -> OK
+
+## 2026-03-13 - упрощение окна "Настройки подключения"
+
+- `trend_analyzer/ui.py`
+  - окно настроек подключения переразложено на три логических блока:
+    - `Основное`
+    - `Архив`
+    - `Дополнительно`
+  - архивные фильтры (`deadband`, `keepalive`) вынесены в отдельный подблок и показываются только если включено `Архив: только изменения`.
+  - технические параметры (`Таймаут`, `Повторы`, `Смещение адреса`, `API host/port/token`) спрятаны под переключатель `Показать доп. настройки`.
+  - параметры `API host/port/token` дополнительно скрываются, если выключен `API локального recorder`.
+  - логика самих настроек не менялась, изменена только подача/видимость.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile` -> OK
+
+## 2026-03-13 - жёсткое выключение Auto X по птичке
+
+- `trend_analyzer/chart.py`
+  - `set_auto_x(False)` больше не включает скрытый `soft follow`.
+  - теперь пользовательское выключение `Авто X` через меню, нижнюю панель, окно шкал и контекстное меню графика должно сразу останавливать автопрокрутку по X.
+  - раньше viewport продолжал ехать до первого ручного движения мышью, из-за чего птичка выглядела "нерабочей".
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\chart.py D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_chart_history_merge tests.test_ui_history_restore tests.test_ui_recorder_command` -> OK
+
+## 2026-03-13 - `/v1/live` отвязан от архивной таблицы
+
+- Диагностика:
+  - при `poll_interval_ms=100` и `render_interval_ms=200` пользователь всё равно видел ступени порядка 1-2 секунд.
+  - проверка реального `recorder_status.json` показала:
+    - `cycles_total` соответствует циклу ~100 мс,
+    - `samples_read_total` растёт как ~10 сигналов на цикл,
+    - но `/v1/live` возвращал точки с шагом ~1.0-1.1 с.
+  - значит узкое место было не в Modbus polling и не в render timer, а в самом recorder API.
+
+- Причина:
+  - `trend_analyzer/recorder_api.py`
+    - endpoint `/v1/live` при `archive_to_db=True` читал данные из `samples`/`connection_events`,
+    - то есть live endpoint фактически отдавал архивную частоту (`archive_interval_ms`), а не живой буфер recorder service.
+
+- Исправление:
+  - `/v1/live` теперь всегда использует `RecorderService.get_live_stream_payload(...)`,
+    независимо от того, включена запись в БД или нет.
+  - история (`/v1/history`) по-прежнему может идти из БД.
+
+- Ожидаемый эффект:
+  - live-график должен следовать частоте опроса/отрисовки,
+  - `archive_interval_ms` больше не должен диктовать видимую дискретность realtime-графика.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\recorder_api.py D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_recorder_service tests.test_ui_recorder_command tests.test_ui_history_restore` -> OK
+
+## 0.66 - 2026-03-13 - direct Modbus в UI синхронизирован с текущими полями окна подключения
+
+- Проблема:
+  - local/direct Modbus в нескольких местах UI использовал `current_profile.ip/port/unit_id`, даже если пользователь уже изменил эти поля в окне `Настройки подключения`, но ещё не успел прожать `Применить/Сохранить`.
+  - из-за этого возникали рассинхроны:
+    - summary мог показывать старый `127.0.0.1`,
+    - подписи локального источника могли расходиться,
+    - окно `Регистры Modbus -> Локальный (прямой Modbus)` мог пытаться читать/писать не туда, куда пользователь сейчас смотрит в UI.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - добавлен `_effective_local_modbus_settings()`;
+    - helper берёт `host/port/unit_id/timeout/address_offset/retries` из текущих виджетов окна подключения и только потом падает обратно на `current_profile`;
+    - на него переведены:
+      - `_source_modbus_settings(None)`,
+      - `_open_tags_client()`,
+      - summary окна подключения,
+      - локальные source labels в combo/tab.
+
+- Эффект:
+  - локальный direct Modbus и все связанные локальные подписи теперь должны жить по одним и тем же фактическим параметрам;
+  - убран класс багов, когда UI уже показывает рабочий PLC address, а runtime direct Modbus ещё ходит по старому адресу.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile` -> OK
+
+## 0.67 - 2026-03-13 - исправлен NameError после refactor local Modbus settings
+
+- Проблема:
+  - после правки `_signal_source_edit_items()` приложение падало на старте окна из-за `NameError: name 'profile' is not defined`.
+  - причина: helper был переведён на `_effective_local_modbus_settings()`, но fallback-ветка для `recorder_sources` всё ещё ссылалась на локальную переменную `profile`, которую больше не объявляли.
+
+- Исправление:
+  - в `trend_analyzer/ui.py` в `_signal_source_edit_items()` возвращено явное объявление `profile = getattr(self, "current_profile", None)`.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile` -> OK
+
+## 0.68 - 2026-03-13 - local direct Modbus добит до конца: не только host/port, но и unit/offset/retries
+
+- Что нашли:
+  - после фикса `host/port` direct Modbus в окне `Регистры Modbus` всё ещё мог частично жить по устаревшему `current_profile`, потому что:
+    - `_read_single_tag()`
+    - `_write_single_tag()`
+    - `_read_tags_many_with_client()`
+    по умолчанию брали `unit_id/address_offset/retries` из `current_profile`, а не из текущих effective-параметров UI.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - перечисленные helper'ы переведены на `_effective_local_modbus_settings()`;
+    - теперь local direct Modbus использует один цельный набор параметров:
+      - `host`
+      - `port`
+      - `unit_id`
+      - `timeout`
+      - `address_offset`
+      - `retries`
+    независимо от того, идёт чтение одной строки, batch-read, запись или pulse.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile tests.test_recorder_service` -> OK
+
+## 0.71 - 2026-03-13 - зафиксирована рабочая версия + безопасная оптимизация live-графика без смены библиотеки
+
+- Рабочая база, от которой продолжаем:
+  - окно `Регистры Modbus` для локального источника переведено на local recorder API-прокси, чтобы не открывать второй прямой Modbus TCP-сеанс параллельно recorder;
+  - `Импульс` удерживает `1`, пока кнопка нажата, и гарантированно возвращает `0` при отпускании;
+  - ложное окно `Есть несохранённые изменения` после явного сохранения убрано;
+  - первый `Рабочий процесс -> Старт` стабилизирован: UI дожидается подъёма recorder/API и больше не требует второй клик.
+
+- Безопасные оптимизации производительности:
+  - `trend_analyzer/ui.py`
+    - local live polling (`recorder API` и fallback-чтение live из SQLite) переведён в неблокирующий executor-путь;
+    - `_poll_db_live_stream()` больше не ждёт сеть/SQLite синхронно в UI-потоке;
+    - добавлен явный выбор local live transport (`api` или `db`) на старте online-сеанса, чтобы runtime не метался между путями;
+    - сохранена жёсткая синхронность `график <-> таблица значений <-> таблица шкал`: частоты обновления не разделялись.
+  - `trend_analyzer/chart.py`
+    - добавлено инкрементальное обновление live-buffer без полного merge на каждую новую точку;
+    - в live follow ужесточены caps на число отрисовываемых точек и downsampling;
+    - вне полного rebuild график теперь перерисовывает только изменившиеся/видимые кривые;
+    - убрана лишняя повторная перерисовка при программном сдвиге X-окна.
+
+- Проверка:
+  - `.venv\\Scripts\\python.exe -m py_compile trend_analyzer\\ui.py trend_analyzer\\chart.py tests\\test_ui_recorder_command.py` -> OK
+  - `.venv\\Scripts\\python.exe -m unittest discover -s tests` -> `60 tests OK`
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\\build_roles_windows.ps1` -> OK
+
+- Сборка:
+  - обновлены `dist\\TrendClient.exe` и `dist\\TrendRecorder.exe`;
+  - сборка прошла clean, без запущенных `TrendClient/TrendRecorder`;
+  - осталось известное нефатальное предупреждение PyInstaller про `pyqtgraph.opengl` / отсутствие `OpenGL`.
+
+## 0.72 - 2026-03-13 - fix: online history/gaps no longer mix stale SQLite archive when archive recording is disabled
+
+- Проблема:
+  - после performance-оптимизации в online-режиме при `archive_to_db = false` клиент местами продолжал подгружать историю из старой `archive.db`;
+  - из-за этого график мог смешивать старую архивную линию/старые разрывы связи с текущим live-сеансом recorder API.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - `_load_recent_online_history_from_db(...)` теперь жёстко отключён для online-сценария с `archive_to_db = false`;
+    - для online history reload при выключенном архиве добавлен маршрут через local recorder API `/v1/history`, а не через SQLite;
+    - перед новым `Рабочий процесс -> Старт` live-график и overlay связи очищаются, чтобы новый live-сеанс не наслаивался на старую картинку.
+
+- Проверка:
+  - `.venv\\Scripts\\python.exe -m unittest discover -s tests` -> `64 tests OK`
+  - `build_roles_windows.ps1` -> OK
+
+## 0.73 - 2026-03-13 - fix: live smoothing no longer behaves like "jelly"
+
+- Проблема:
+  - в режиме live сглаживание использовало центрированное moving average;
+  - из-за этого уже показанные точки зависели от будущих значений и начинали "перетекать" назад при приходе новых samples.
+
+- Исправление:
+  - `trend_analyzer/chart.py`
+    - для live follow сглаживание переведено на causal/trailing average;
+    - для статического/history-view оставлено центрированное сглаживание;
+    - итог: live-кривая больше не должна "ехать как желе" при включённом сглаживании.
+
+- Проверка:
+  - `.venv\\Scripts\\python.exe -m unittest discover -s tests` -> `66 tests OK`
+  - `build_roles_windows.ps1` -> OK
+
+## 0.71 - 2026-03-13 - local direct Modbus window reverted to true direct path
+
+- Проблема:
+  - окно `Регистры Modbus` после последних фиксов стало смешивать два разных пути для локального источника: `Локальный (прямой Modbus)` местами шёл напрямую в PLC, а местами пытался читать/писать через local recorder API proxy;
+  - это давало нестабильное поведение: `Ошибка чтения`, залипание `Импульс=1` и труднодиагностируемые конфликты.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - для локального источника окна `Регистры Modbus` убрана скрытая переадресация через `_local_modbus_proxy_source()`;
+    - локальные `single write`, `pulse`, `read once`, `write marked` снова используют только прямой `ModbusTcpClient`;
+    - в `_read_tags_once()` одновременно убран хвост с потенциально неинициализированными `unit_id/address_offset` в fallback-цепочке.
+
+- Зачем:
+  - окно называется `Локальный (прямой Modbus)` и должно ходить в устройство ровно одним понятным путём;
+  - для диагностического окна предсказуемость важнее, чем попытка "умно" подменить транспорт.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile tests.test_recorder_service` -> OK
+
+## 0.72 - 2026-03-13 - pulse path hardened in `Регистры Modbus`
+
+- Проблема:
+  - пользователь продолжал получать `Ошибка записи`/`Импульс=1` в окне `Регистры Modbus`, хотя low-level direct Modbus до тех же адресов `36/38` и тот же код записи вне UI проходили успешно;
+  - значит ломался именно UI-сценарий `интервальное чтение + кнопка Импульс + отпускание`.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - запись `Импульс` для local/modbus source теперь делает повторные попытки (`retries + 1`) с короткой паузой между ними;
+    - добавлен `_active_pulse_tag_id_for_row(...)`, чтобы release-path мог корректно завершить импульс даже если `tag_id` не удалось заново собрать из строки;
+    - на время активного импульса окно приостанавливает `Старт`-таймер чтения и автоматически возобновляет его после release;
+    - добавлен fail-safe timer на 1200 ms: если release-сигнал потеряется, активный импульс всё равно принудительно сбрасывается в `0`.
+
+- Зачем:
+  - убрать залипание `Импульс=1`;
+  - убрать ложные `Ошибка записи` от transient-сбоев/рваной UI-цепочки release;
+  - изолировать pulse-операцию от фонового polling-а окна регистров.
+
+- Доп.проверка:
+  - low-level direct write/read до `192.168.4.218:502`, Unit 1, адресов `36` и `38`, bit 1 -> OK;
+  - scripted UI-scenario `polling on -> mousePress/mouseRelease on pulse button` для обеих строк -> status `Импульс=0`, `active_ids=[]`, polling resumed.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile tests.test_recorder_service` -> OK
+
+## 0.69 - 2026-03-13 - окно "Регистры Modbus" при работающем recorder читает local PLC через local recorder API-прокси
+
+- Наблюдение:
+  - direct low-level read до PLC и batched read на тех же адресах проходят успешно;
+  - значит `Ошибка чтения` в окне `Регистры Modbus` при нажатии `Старт` была связана не с самим PLC и не с декодером, а с runtime-конфликтом доступа.
+  - наиболее вероятный сценарий: локальный recorder уже держит Modbus polling, а окно регистров открывает второй прямой Modbus-клиент в тот же PLC.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - добавлен `_local_modbus_proxy_source()`:
+      - если локальный recorder API доступен и recorder запущен, окно регистров для локального источника использует не прямой второй TCP client, а local recorder API.
+    - добавлен `_source_modbus_request_overrides(...)`:
+      - local recorder API теперь получает явные overrides `host/port/unit_id/timeout_s/address_offset`,
+      - для batch-read также `read_attempts`.
+    - на local recorder API-прокси переведены:
+      - `_read_tags_once()` для `source is None`,
+      - `_on_write_tags_clicked()` для batch-write локального источника,
+      - `_on_write_single_tag_row_clicked()` для одиночной записи,
+      - `_write_tag_row_forced_value()` для pulse,
+      - а также payloads `/v1/modbus/read`, `/v1/modbus/write`, `/v1/modbus/read_many`.
+
+- Эффект:
+  - при работающем local recorder окно `Регистры Modbus` не должно больше конфликтовать со вторым прямым Modbus-соединением;
+  - `Старт` / `Интервал чтения` для локального источника должны идти через local recorder API-прокси с текущими effective-настройками подключения.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py D:\\TrendAnalyzer\\trend_analyzer\\recorder_api.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile tests.test_recorder_service` -> OK
+
+## 0.70 - 2026-03-13 - Modbus register browser: fallback с batch-read на single-read + явный текст первой ошибки
+
+- Проблема:
+  - даже после выравнивания local Modbus settings и local recorder API proxy пользователь всё ещё видел `Ошибка чтения` в окне `Регистры Modbus`.
+  - низкоуровневые прямые чтения тех же адресов в dev-среде проходят, поэтому нужен более надёжный failover прямо в UI-цепочке окна регистров.
+
+- Исправление:
+  - `trend_analyzer/ui.py`
+    - добавлен `_read_tags_individually_with_client(...)`;
+    - если grouped/batch read не вернул значения для части строк local/modbus source, окно автоматически перечитывает отсутствующие строки по одной;
+    - в итоговый статус чтения теперь прокидывается текст первой реальной ошибки, а не только общий счётчик `ошибок N`.
+
+- Зачем:
+  - для окна диагностики регистров надёжность важнее микрооптимизации;
+  - если проблема именно в batch/grouped chain, single-read fallback должен спасти чтение;
+  - если чтение всё ещё не проходит, статус теперь покажет первичную причину, а не только общий `Ошибка чтения`.
+
+- Проверка:
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m py_compile D:\\TrendAnalyzer\\trend_analyzer\\ui.py` -> OK
+  - `D:\\TrendAnalyzer\\.venv\\Scripts\\python.exe -m unittest tests.test_ui_recorder_command tests.test_ui_history_restore tests.test_models_profile tests.test_recorder_service` -> OK
