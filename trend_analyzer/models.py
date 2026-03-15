@@ -353,7 +353,7 @@ class ProfileConfig:
             poll_interval_ms=max(50, int(payload.get("poll_interval_ms") or 500)),
             render_interval_ms=max(50, int(payload.get("render_interval_ms") or 200)),
             render_chart_enabled=bool(payload.get("render_chart_enabled", True)),
-            archive_interval_ms=max(50, int(payload.get("archive_interval_ms") or 1000)),
+            archive_interval_ms=max(50, int(payload.get("poll_interval_ms") or 500)),  # always equal to poll
             archive_on_change_only=bool(payload.get("archive_on_change_only", False)),
             archive_deadband=max(0.0, float(payload.get("archive_deadband", 0.0))),
             archive_keepalive_s=max(0, int(payload.get("archive_keepalive_s", 60))),

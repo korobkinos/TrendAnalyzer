@@ -1896,7 +1896,6 @@ class MainWindow(QMainWindow):
         self.runtime_status_label.setStyleSheet(f"font-size: 11px; color: {c['muted_text']};")
         self.connection_sources_summary_label.setStyleSheet(f"color: {c['muted_text']};")
         self.connection_sources_hint_label.setStyleSheet(f"color: {c['muted_text']}; font-size: 11px;")
-        self.graph_smoothing_hint_label.setStyleSheet(f"color: {c['muted_text']};")
         self._enforce_spin_controls_globally()
 
     def _build_connection_window(self) -> None:
@@ -1985,9 +1984,6 @@ class MainWindow(QMainWindow):
         self.render_chart_checkbox = QCheckBox('Включена')
         self.render_chart_checkbox.setChecked(True)
         self.render_chart_checkbox.toggled.connect(self._on_render_chart_toggled)
-        self.archive_interval_spin = QSpinBox()
-        self.archive_interval_spin.setRange(50, 600000)
-        self.archive_interval_spin.setSuffix(" ms")
         self.archive_on_change_checkbox = QCheckBox('Только при изменении')
         self.archive_on_change_checkbox.toggled.connect(self._on_archive_filter_settings_changed)
         self.archive_deadband_spin = QDoubleSpinBox()
@@ -2056,7 +2052,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(_section_title("Архив"))
         archive_form = QFormLayout()
-        archive_form.addRow('Частота архивации', self.archive_interval_spin)
         archive_form.addRow('Архив: только изменения', self.archive_on_change_checkbox)
         archive_form.addRow('Ограничение архива', self.archive_retention_mode_combo)
         archive_form.addRow('Глубина архива (дни)', self.archive_retention_days_spin)
@@ -5196,14 +5191,6 @@ class MainWindow(QMainWindow):
         self.graph_grid_alpha_spin.setSuffix(" %")
         self.graph_grid_x_checkbox = QCheckBox('Вертикальная (X)')
         self.graph_grid_y_checkbox = QCheckBox('Горизонтальная (Y)')
-        self.graph_smoothing_checkbox = QCheckBox('Включено')
-        self.graph_smoothing_window_spin = QSpinBox()
-        self.graph_smoothing_window_spin.setRange(3, 31)
-        self.graph_smoothing_window_spin.setSingleStep(2)
-        self.graph_smoothing_window_spin.setSuffix(" тчк")
-        self.graph_smoothing_window_spin.setValue(5)
-        self.graph_smoothing_window_spin.setEnabled(False)
-        self.graph_smoothing_checkbox.toggled.connect(self.graph_smoothing_window_spin.setEnabled)
 
         form.addRow('Тема интерфейса и графика', self.ui_theme_combo)
         form.addRow('Цвет фона графика', self.graph_bg_btn)
@@ -5211,16 +5198,8 @@ class MainWindow(QMainWindow):
         form.addRow('Прозрачность сетки', self.graph_grid_alpha_spin)
         form.addRow('Сетка X', self.graph_grid_x_checkbox)
         form.addRow('Сетка Y', self.graph_grid_y_checkbox)
-        form.addRow('Сглаживание кривой', self.graph_smoothing_checkbox)
-        form.addRow('Окно сглаживания', self.graph_smoothing_window_spin)
         layout.addLayout(form)
 
-        self.graph_smoothing_hint_label = QLabel(
-            "Сглаживание влияет только на отображение графика и не изменяет архивные данные."
-        )
-        self.graph_smoothing_hint_label.setWordWrap(True)
-        self.graph_smoothing_hint_label.setStyleSheet("color: #8f98a6;")
-        layout.addWidget(self.graph_smoothing_hint_label)
 
         apply_row = QHBoxLayout()
         self.graph_apply_btn = QPushButton('Применить')
@@ -6491,7 +6470,6 @@ class MainWindow(QMainWindow):
         self.render_chart_checkbox.blockSignals(True)
         self.render_chart_checkbox.setChecked(bool(profile.render_chart_enabled))
         self.render_chart_checkbox.blockSignals(False)
-        self.archive_interval_spin.setValue(profile.archive_interval_ms)
         self.archive_on_change_checkbox.setChecked(bool(profile.archive_on_change_only))
         self.archive_deadband_spin.setValue(max(0.0, float(profile.archive_deadband)))
         self.archive_keepalive_spin.setValue(max(0, int(profile.archive_keepalive_s)))
@@ -6607,19 +6585,6 @@ class MainWindow(QMainWindow):
         self.graph_grid_alpha_spin.setValue(max(0, min(100, alpha_value)))
         self.graph_grid_x_checkbox.setChecked(bool(profile.plot_grid_x))
         self.graph_grid_y_checkbox.setChecked(bool(profile.plot_grid_y))
-        smooth_enabled = bool(getattr(profile, "plot_smoothing_enabled", False))
-        try:
-            smooth_window = int(getattr(profile, "plot_smoothing_window", 5) or 5)
-        except (TypeError, ValueError):
-            smooth_window = 5
-        smooth_window = max(3, min(31, smooth_window))
-        if smooth_window % 2 == 0:
-            smooth_window = smooth_window + 1 if smooth_window < 31 else smooth_window - 1
-        self.graph_smoothing_checkbox.blockSignals(True)
-        self.graph_smoothing_checkbox.setChecked(smooth_enabled)
-        self.graph_smoothing_checkbox.blockSignals(False)
-        self.graph_smoothing_window_spin.setValue(smooth_window)
-        self.graph_smoothing_window_spin.setEnabled(smooth_enabled)
 
     def _reset_graph_settings_ui(self) -> None:
         theme_index = self.ui_theme_combo.findData("dark")
@@ -6629,9 +6594,6 @@ class MainWindow(QMainWindow):
         self._set_graph_theme_defaults_to_ui("dark")
         self.graph_grid_x_checkbox.setChecked(True)
         self.graph_grid_y_checkbox.setChecked(True)
-        self.graph_smoothing_checkbox.setChecked(False)
-        self.graph_smoothing_window_spin.setValue(5)
-        self.graph_smoothing_window_spin.setEnabled(False)
         self._apply_graph_settings_from_ui()
 
     def _pick_graph_color(self, target: str) -> None:
@@ -6659,21 +6621,13 @@ class MainWindow(QMainWindow):
         alpha = max(0, min(100, int(self.graph_grid_alpha_spin.value())))
         grid_x = bool(self.graph_grid_x_checkbox.isChecked())
         grid_y = bool(self.graph_grid_y_checkbox.isChecked())
-        smooth_enabled = bool(self.graph_smoothing_checkbox.isChecked())
-        smooth_window = max(3, min(31, int(self.graph_smoothing_window_spin.value())))
-        if smooth_window % 2 == 0:
-            smooth_window = smooth_window + 1 if smooth_window < 31 else smooth_window - 1
 
         self.current_profile.plot_background_color = bg
         self.current_profile.plot_grid_color = grid
         self.current_profile.plot_grid_alpha = alpha
         self.current_profile.plot_grid_x = grid_x
         self.current_profile.plot_grid_y = grid_y
-        self.current_profile.plot_smoothing_enabled = smooth_enabled
-        self.current_profile.plot_smoothing_window = smooth_window
         self.current_profile.ui_theme_preset = theme_id
-        self.graph_smoothing_window_spin.setValue(smooth_window)
-        self.graph_smoothing_window_spin.setEnabled(smooth_enabled)
 
         self.chart.set_visual_settings(
             background_color=bg,
@@ -6682,7 +6636,7 @@ class MainWindow(QMainWindow):
             grid_x=grid_x,
             grid_y=grid_y,
         )
-        self.chart.set_curve_smoothing(smooth_enabled, smooth_window)
+        self.chart.set_curve_smoothing(False, 5)
         self._apply_ui_theme_runtime(self.current_profile)
         if not self._updating_ui:
             self._mark_config_dirty()
@@ -6792,7 +6746,7 @@ class MainWindow(QMainWindow):
         profile.poll_interval_ms = self.poll_interval_spin.value()
         profile.render_interval_ms = self.render_interval_spin.value()
         profile.render_chart_enabled = bool(self.render_chart_checkbox.isChecked())
-        profile.archive_interval_ms = self.archive_interval_spin.value()
+        profile.archive_interval_ms = profile.poll_interval_ms  # always equal to poll
         profile.archive_on_change_only = bool(self.archive_on_change_checkbox.isChecked())
         profile.archive_deadband = max(0.0, float(self.archive_deadband_spin.value()))
         profile.archive_keepalive_s = max(0, int(self.archive_keepalive_spin.value()))
@@ -6818,11 +6772,6 @@ class MainWindow(QMainWindow):
         profile.plot_grid_alpha = max(0, min(100, int(self.graph_grid_alpha_spin.value())))
         profile.plot_grid_x = bool(self.graph_grid_x_checkbox.isChecked())
         profile.plot_grid_y = bool(self.graph_grid_y_checkbox.isChecked())
-        profile.plot_smoothing_enabled = bool(self.graph_smoothing_checkbox.isChecked())
-        smooth_window = max(3, min(31, int(self.graph_smoothing_window_spin.value())))
-        if smooth_window % 2 == 0:
-            smooth_window = smooth_window + 1 if smooth_window < 31 else smooth_window - 1
-        profile.plot_smoothing_window = smooth_window
         theme_id = str(self.ui_theme_combo.currentData() or "dark").strip().lower()
         profile.ui_theme_preset = theme_id if theme_id in UI_THEME_PRESETS else "dark"
         profile.tags_bulk_start_address = max(0, int(self.tags_start_addr_spin.value()))
@@ -6850,7 +6799,7 @@ class MainWindow(QMainWindow):
             "poll_interval_ms": int(profile.poll_interval_ms),
             "render_interval_ms": int(profile.render_interval_ms),
             "render_chart_enabled": bool(profile.render_chart_enabled),
-            "archive_interval_ms": int(profile.archive_interval_ms),
+            "archive_interval_ms": int(profile.poll_interval_ms),  # always equal to poll
             "archive_on_change_only": bool(profile.archive_on_change_only),
             "archive_deadband": float(profile.archive_deadband),
             "archive_keepalive_s": int(profile.archive_keepalive_s),
@@ -6958,7 +6907,6 @@ class MainWindow(QMainWindow):
         self.render_chart_checkbox.blockSignals(True)
         self.render_chart_checkbox.setChecked(bool(profile.render_chart_enabled))
         self.render_chart_checkbox.blockSignals(False)
-        self.archive_interval_spin.setValue(profile.archive_interval_ms)
         self.archive_on_change_checkbox.setChecked(bool(profile.archive_on_change_only))
         self.archive_deadband_spin.setValue(max(0.0, float(profile.archive_deadband)))
         self.archive_keepalive_spin.setValue(max(0, int(profile.archive_keepalive_s)))
@@ -8739,27 +8687,28 @@ class MainWindow(QMainWindow):
         self,
         batch: list[tuple[float, dict[str, tuple[str, float]]]],
     ) -> list[tuple[float, dict[str, tuple[str, float]]]]:
-        if not batch:
-            return batch
-        latest_samples: dict[str, tuple[str, float]] = {}
-        latest_ts: float | None = None
-        for ts, samples in batch:
-            try:
-                ts_f = float(ts)
-            except (TypeError, ValueError):
-                continue
-            if latest_ts is None or ts_f > latest_ts:
-                latest_ts = ts_f
-            for signal_id, payload in samples.items():
-                try:
-                    signal_name, value = payload
-                    latest_samples[str(signal_id)] = (str(signal_name), float(value))
-                except Exception:
-                    continue
-        if not latest_samples:
-            return batch
-        anchor_ts = max(float(latest_ts or 0.0), float(datetime.now().timestamp()))
-        return [(anchor_ts, latest_samples)]
+        return batch
+        # if not batch:
+        #     return batch
+        # latest_samples: dict[str, tuple[str, float]] = {}
+        # latest_ts: float | None = None
+        # for ts, samples in batch:
+        #     try:
+        #         ts_f = float(ts)
+        #     except (TypeError, ValueError):
+        #         continue
+        #     if latest_ts is None or ts_f > latest_ts:
+        #         latest_ts = ts_f
+        #     for signal_id, payload in samples.items():
+        #         try:
+        #             signal_name, value = payload
+        #             latest_samples[str(signal_id)] = (str(signal_name), float(value))
+        #         except Exception:
+        #             continue
+        # if not latest_samples:
+        #     return batch
+        # anchor_ts = max(float(latest_ts or 0.0), float(datetime.now().timestamp()))
+        # return [(anchor_ts, latest_samples)]
 
     def _flush_pending_render_samples(self) -> None:
         pending_total = len(self._pending_render_samples)

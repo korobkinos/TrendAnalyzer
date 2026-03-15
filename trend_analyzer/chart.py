@@ -1249,13 +1249,13 @@ class MultiAxisChart(QWidget):
             if self._curve_smoothing_enabled and draw_ys:
                 data_type = str(meta.get("data_type", "") or "").strip().lower() if isinstance(meta, dict) else ""
                 if data_type != "bool":
-                    # In live-follow mode use causal smoothing, so already
-                    # plotted points do not "flow" backwards when new samples
-                    # arrive. Centered smoothing is kept for static/history views.
+                    # Always use centered smoothing so live-follow and history
+                    # views look identical — the same signal shape regardless of
+                    # which viewing mode is active.
                     draw_ys = self._smooth_series_moving_average(
                         draw_ys,
                         self._curve_smoothing_window,
-                        causal=self._follows_latest_x(),
+                        causal=False,
                     )
             curve.setData(draw_xs, draw_ys)
 
@@ -1520,15 +1520,11 @@ class MultiAxisChart(QWidget):
 
         enabled = self._enabled_signal_count()
         per_signal_cap = max(self._min_render_points, int(self._max_total_render_points / max(1, enabled)))
-        if self._follows_latest_x():
-            target = int(target * 0.55)
-            target = min(target, int(self._live_follow_render_points_cap))
-            target = min(target, int(self._live_follow_detail_points_cap))
-            per_signal_cap = min(
-                per_signal_cap,
-                max(self._min_render_points, int(self._live_follow_total_points_cap / max(1, enabled))),
-            )
         target = min(target, per_signal_cap)
+        # Cap at 2x screen pixels — forces averaging on dense data,
+        # making live-follow and history look consistent at equal zoom.
+        screen_cap = max(self._min_render_points, width_px * 2)
+        target = min(target, screen_cap)
         return max(self._min_render_points, int(target))
 
     def _visible_slice_bounds(self, xs: list[float], x_min: float, x_max: float) -> tuple[int, int]:
@@ -1551,70 +1547,32 @@ class MultiAxisChart(QWidget):
         ys: list[float],
         max_points: int,
     ) -> tuple[list[float], list[float]]:
+        """Average-bucket decimation.
+        Keeps visual shape identical at any zoom level.
+        No rectangular spikes from min/max selection.
+        """
         count = len(xs)
         if count <= max_points or max_points <= 0:
             return xs, ys
-        if max_points < 4:
-            step = max(1, count // max_points)
-            out_xs = xs[::step]
-            out_ys = ys[::step]
-            if out_xs and out_xs[-1] != xs[-1]:
-                out_xs.append(xs[-1])
-                out_ys.append(ys[-1])
-            return out_xs, out_ys
-
-        # Min/Max bucket decimation preserves spikes significantly better than
-        # uniform stepping while staying lightweight for realtime redraws.
-        buckets = max(1, (max_points - 2) // 2)
-        bucket_size = float(count - 2) / float(buckets) if buckets > 0 else float(count)
-        out_xs: list[float] = [xs[0]]
-        out_ys: list[float] = [ys[0]]
-
-        for bucket_idx in range(buckets):
-            start = 1 + int(bucket_idx * bucket_size)
-            end = 1 + int((bucket_idx + 1) * bucket_size)
-            end = min(end, count - 1)
+        if max_points < 2:
+            return [xs[0], xs[-1]], [ys[0], ys[-1]]
+        buckets = max(1, max_points)
+        bucket_size = float(count) / float(buckets)
+        out_xs: list[float] = []
+        out_ys: list[float] = []
+        for b in range(buckets):
+            start = int(b * bucket_size)
+            end = min(count, int((b + 1) * bucket_size))
             if end <= start:
                 continue
-
-            min_i = start
-            max_i = start
-            min_v = ys[start]
-            max_v = ys[start]
-            for i in range(start + 1, end):
-                v = ys[i]
-                if v < min_v:
-                    min_v = v
-                    min_i = i
-                if v > max_v:
-                    max_v = v
-                    max_i = i
-
-            if min_i < max_i:
-                idxs = (min_i, max_i)
-            elif max_i < min_i:
-                idxs = (max_i, min_i)
-            else:
-                idxs = (min_i,)
-
-            for i in idxs:
-                out_xs.append(xs[i])
-                out_ys.append(ys[i])
-
-        out_xs.append(xs[-1])
-        out_ys.append(ys[-1])
-
-        if len(out_xs) <= max_points:
-            return out_xs, out_ys
-
-        # Fallback clamp for corner cases where bucket rounding overflows target.
-        step = max(1, len(out_xs) // max_points)
-        clamped_xs = out_xs[::step]
-        clamped_ys = out_ys[::step]
-        if clamped_xs and clamped_xs[-1] != out_xs[-1]:
-            clamped_xs.append(out_xs[-1])
-            clamped_ys.append(out_ys[-1])
-        return clamped_xs, clamped_ys
+            mid = start + (end - start) // 2
+            avg_y = sum(ys[start:end]) / (end - start)
+            out_xs.append(xs[mid])
+            out_ys.append(avg_y)
+        if out_xs and out_xs[-1] != xs[-1]:
+            out_xs.append(xs[-1])
+            out_ys.append(ys[-1])
+        return out_xs, out_ys
 
     def _on_mouse_clicked(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
@@ -1857,4 +1815,3 @@ class MultiAxisChart(QWidget):
             )
 
         self.scales_changed.emit(rows)
-
